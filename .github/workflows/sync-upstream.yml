@@ -1,0 +1,45 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge upstream without overwriting localization
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Edwardhehe/batchPrintZWCAD.git
+          git fetch upstream --prune --tags
+          git checkout main
+          git merge --no-ff --no-edit upstream/main
+          git push origin main
+      - name: Tag merged upstream releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin --tags
+          latest="$(git tag --list 'v*' --sort=-version:refname | head -n1 || true)"
+          upstream_tag="$(git tag -l 'v*' --sort=-version:refname | head -n1 || true)"
+          if [ -n "$upstream_tag" ] && ! git show-ref --tags --verify --quiet "refs/tags/$upstream_tag"; then
+            git tag "$upstream_tag"
+            git push origin "$upstream_tag"
+          fi
