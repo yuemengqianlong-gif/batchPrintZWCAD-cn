@@ -36,10 +36,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin --tags
-          latest="$(git tag --list 'v*' --sort=-version:refname | head -n1 || true)"
-          upstream_tag="$(git tag -l 'v*' --sort=-version:refname | head -n1 || true)"
-          if [ -n "$upstream_tag" ] && ! git show-ref --tags --verify --quiet "refs/tags/$upstream_tag"; then
+          upstream_tag="$(git ls-remote --refs --tags upstream 'v*' | awk -F/ '{print $3}' | sort -V | tail -n1)"
+          if [ -n "$upstream_tag" ] && ! git ls-remote --exit-code --refs origin "refs/tags/$upstream_tag" >/dev/null 2>&1; then
             git tag "$upstream_tag"
             git push origin "$upstream_tag"
           fi
