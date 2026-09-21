@@ -1,0 +1,47 @@
+name: Build batch printing plugin
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build solution
+        shell: pwsh
+        run: dotnet build LA.BatchPlot.sln -c Release --no-restore
+
+      - name: Package release
+        shell: pwsh
+        run: |
+          if (Test-Path .\scripts\build-dll.ps1) {
+            .\scripts\build-dll.ps1 -Target All -Configuration Release
+          }
+          if (Test-Path .\scripts\package-release.ps1) {
+            .\scripts\package-release.ps1 -Version ${{ github.run_number }}
+          }
+
+      - name: Collect build output
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Get-ChildItem -Path . -Include *.dll,*.zip -Recurse -File | Copy-Item -Destination artifact -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: batchPrintZWCAD-cn-build-${{ github.run_number }}
+          path: artifact
+          if-no-files-found: error
