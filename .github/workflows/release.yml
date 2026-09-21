@@ -1,0 +1,45 @@
+name: Build and publish release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (for example v1.15.7.5)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build solution
+        shell: pwsh
+        run: dotnet build LA.BatchPlot.sln -c Release
+      - name: Package release
+        shell: pwsh
+        run: .\\scripts\\package-release.ps1 -Version \${{ inputs.version || github.ref_name }}
+      - name: Collect release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Get-ChildItem -Path . -Include *.zip -Recurse -File | Copy-Item -Destination artifact -Force
+          if (-not (Get-ChildItem artifact -File)) { throw "No release archives were produced." }
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: \${{ github.token }}
+        shell: pwsh
+        run: |
+          \$tag = \${{ github.ref_type == 'tag' && 'github.ref_name' || 'inputs.version' }}
+          if (-not \$tag) { throw "A tag or version is required." }
+          gh release create \$tag artifact\\* --title \$tag --generate-notes
