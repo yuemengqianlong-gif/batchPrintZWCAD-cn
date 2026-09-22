@@ -612,13 +612,15 @@ public sealed class FieldBoxSelectDialog : Form
     }
 
     /// <summary>
-    /// CAD 模态窗口建立自己的消息循环后再强制重绘一次，确保窗口首次出现时红色打印范围已经可见。
+    /// 首次显示时刷新红色临时框。只用 UpdateScreen，不做 Regen：
+    /// 整图重生成会在非模态 Show 期间拖住 UI 线程，复杂图面会出现白块对话框并长时间卡顿。
+    /// Transient DirectTopmost 标识经 UpdateScreen 即可看见。
     /// </summary>
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
         RefreshAllMarkers();
-        _markers.RefreshDisplay(regenerate: true);
+        _markers.RefreshDisplay(regenerate: false);
     }
 
     /// <summary>

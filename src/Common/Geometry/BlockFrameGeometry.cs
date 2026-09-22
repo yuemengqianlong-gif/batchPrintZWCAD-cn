@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 #if AUTOCAD
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.Geometry;
@@ -15,15 +16,23 @@ internal enum BlockFrameSource
 {
     None,
     ClosedRectangle,
+    /// <summary>由四根独立直线或直线型开放多段线边拼合得到的外框。</summary>
+    FourLineRectangle,
     LineExtents
 }
 
 /// <summary>
 /// 块定义内图框外边界的公共识别器。图框录入和正式扫描必须使用同一套“最大闭合矩形优先、
-/// 可见线类包围盒回退”规则，保证打印范围与录入时识别的边框一致。
+/// 四线拼合矩形并入比选、可见线类包围盒回退”规则，保证打印范围与录入时识别的边框一致。
 /// </summary>
 internal static class BlockFrameGeometry
 {
+    /// <summary>
+    /// 与扫描仪块内四线收集一致：根定义及浅层嵌套（depth ≤ 3）收集独立边；
+    /// 闭合矩形仍按既有深度上限 12 收集。
+    /// </summary>
+    private const int FourLineSegmentMaxDepth = 3;
+
     internal static bool TryGetFrame(
         Database database,
         ObjectId rootDefinitionId,
@@ -57,22 +66,40 @@ internal static class BlockFrameGeometry
             return cached.Ok;
         }
 
-        var rectangles = new List<LocalRectangle>();
+        var closedRectangles = new List<LocalRectangle>();
+        var segments = new List<FourLineRectangleFinder.Segment>();
         var lineExtents = new List<Extents3d>();
         Collect(
             tr,
             rootDefinitionId,
             Matrix3d.Identity,
-            rectangles,
+            closedRectangles,
+            segments,
             lineExtents,
             new HashSet<ObjectId>(),
             depth: 0);
 
-        bool ok;
-        if (rectangles.Count > 0)
+        var fourLineRectangles = segments.Count >= 4
+            ? FourLineRectangleFinder.Find(segments, CancellationToken.None)
+            : new List<LocalRectangle>();
+
+        var candidates = new List<(LocalRectangle Rect, BlockFrameSource Source)>(
+            closedRectangles.Count + fourLineRectangles.Count);
+        foreach (var rect in closedRectangles)
         {
-            frame = rectangles.OrderByDescending(RectangleGeometry.GetActualArea).First();
-            source = BlockFrameSource.ClosedRectangle;
+            candidates.Add((rect, BlockFrameSource.ClosedRectangle));
+        }
+        foreach (var rect in fourLineRectangles)
+        {
+            candidates.Add((rect, BlockFrameSource.FourLineRectangle));
+        }
+
+        bool ok;
+        if (candidates.Count > 0)
+        {
+            var best = candidates.OrderByDescending(item => RectangleGeometry.GetActualArea(item.Rect)).First();
+            frame = best.Rect;
+            source = best.Source;
             ok = frame.HasArea();
         }
         else if (lineExtents.Count == 0)
@@ -111,7 +138,8 @@ internal static class BlockFrameGeometry
         Transaction tr,
         ObjectId definitionId,
         Matrix3d definitionToRoot,
-        ICollection<LocalRectangle> rectangles,
+        ICollection<LocalRectangle> closedRectangles,
+        ICollection<FourLineRectangleFinder.Segment> segments,
         ICollection<Extents3d> lineExtents,
         ISet<ObjectId> visitedDefinitions,
         int depth)
@@ -148,7 +176,29 @@ internal static class BlockFrameGeometry
 
                     if (isClosedRectangle)
                     {
-                        rectangles.Add(RectangleGeometry.TransformRectangle(localRectangle, definitionToRoot));
+                        closedRectangles.Add(
+                            RectangleGeometry.TransformRectangle(localRectangle, definitionToRoot));
+                    }
+
+                    // 四线边：仅浅层收集，与扫描仪块内 depth≤3 一致。
+                    if (depth <= FourLineSegmentMaxDepth)
+                    {
+                        if (entity is Line line)
+                        {
+                            FourLineRectangleFinder.TryAddLine(line, definitionToRoot, segments);
+                        }
+                        else if (entity is Polyline openPl
+                            && FourLineRectangleFinder.TryGetStraightOpenPolylineSegment(
+                                openPl, definitionToRoot, out var plSeg))
+                        {
+                            segments.Add(plSeg);
+                        }
+                        else if (entity is Polyline2d openPl2d
+                            && FourLineRectangleFinder.TryGetStraightOpenPolyline2dSegment(
+                                tr, openPl2d, definitionToRoot, out var pl2dSeg))
+                        {
+                            segments.Add(pl2dSeg);
+                        }
                     }
 
                     if (entity is Line or Polyline or Polyline2d or Polyline3d)
@@ -176,7 +226,8 @@ internal static class BlockFrameGeometry
                         tr,
                         nested.BlockTableRecord,
                         nested.BlockTransform * definitionToRoot,
-                        rectangles,
+                        closedRectangles,
+                        segments,
                         lineExtents,
                         visitedDefinitions,
                         depth + 1);

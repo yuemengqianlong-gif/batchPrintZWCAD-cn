@@ -1257,20 +1257,139 @@ public sealed partial class RectangleBatchPlotForm : Window
 
         _viewSortedByHeader = false;
         _sortMemberPath = "";
-        var horizontalFirst = _settings.SortOrderHorizontalFirst;
 
         var allRows = _rows.ToList();
-        var jobToRow = allRows.ToDictionary(row => row.Job, row => row);
-        var sortedRows = SpatialSorter.SortByLayout(
-                allRows.Select(row => row.Job).ToList(),
-                horizontalFirst)
-            .Select(job => jobToRow[job])
-            .ToList();
+        var sortedRows = SortRectangleRows(allRows);
 
         ReplaceBindingListContents(_rows, sortedRows);
         RefreshDisplayRows();
         RefreshFileNames();
         UpdateVisuals();
+    }
+
+    /// <summary>
+    /// 通用型排序：多文件时先按文件名；同一文件内有识别图号则按图号，否则与单文件批打相同（布局 + 空间位置）。
+    /// </summary>
+    private List<Row> SortRectangleRows(IReadOnlyList<Row> rows)
+    {
+        var result = new List<Row>(rows.Count);
+        var sourceGroups = rows
+            .Select((row, index) => new { Row = row, Index = index })
+            .GroupBy(item => GetSourceGroupKey(item.Row.Job.SourceFile), StringComparer.OrdinalIgnoreCase)
+            .OrderBy(group => GetSourceFileSortName(group.Key), NaturalStringComparer.Instance)
+            .ThenBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(group => group.Min(item => item.Index));
+
+        foreach (var sourceGroup in sourceGroups)
+        {
+            var fileRows = sourceGroup.Select(item => item.Row).ToList();
+            result.AddRange(SortRowsWithinSourceFile(fileRows));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 单文件内排序：有识别图号（属性身份模式）时按图号自然序，同图号再用单文件空间序打断平局；
+    /// 否则直接按单文件打印顺序（SpatialSorter.SortByLayout）。
+    /// </summary>
+    private List<Row> SortRowsWithinSourceFile(List<Row> fileRows)
+    {
+        if (fileRows.Count <= 1)
+        {
+            return fileRows;
+        }
+
+        var horizontalFirst = _settings.SortOrderHorizontalFirst;
+        var jobToRow = fileRows.ToDictionary(row => row.Job, row => row);
+
+        if (_hasAttributeIdentity)
+        {
+            var byDrawingNumber = fileRows
+                .OrderBy(row => row.Job.DrawingNumber ?? "", NaturalStringComparer.Instance)
+                .ThenBy(row => row.Job.Title ?? "", StringComparer.CurrentCultureIgnoreCase)
+                .Select(row => row.Job)
+                .ToList();
+
+            return SpatiallyBreakTiesWithinFile(byDrawingNumber)
+                .Select(job => jobToRow[job])
+                .ToList();
+        }
+
+        return SpatialSorter.SortByLayout(fileRows.Select(row => row.Job).ToList(), horizontalFirst)
+            .Select(job => jobToRow[job])
+            .ToList();
+    }
+
+    /// <summary>
+    /// 图号（及图名）完全相同的连续段内，按单文件空间顺序二次排序。
+    /// </summary>
+    private List<PlotJob> SpatiallyBreakTiesWithinFile(List<PlotJob> sortedJobs)
+    {
+        if (sortedJobs.Count <= 1)
+        {
+            return sortedJobs;
+        }
+
+        var horizontalFirst = _settings.SortOrderHorizontalFirst;
+        var result = new List<PlotJob>(sortedJobs.Count);
+        var i = 0;
+        while (i < sortedJobs.Count)
+        {
+            var anchor = sortedJobs[i];
+            var j = i + 1;
+            while (j < sortedJobs.Count
+                && NaturalStringComparer.Instance.Compare(sortedJobs[j].DrawingNumber, anchor.DrawingNumber) == 0
+                && string.Equals(sortedJobs[j].Title, anchor.Title, StringComparison.CurrentCultureIgnoreCase))
+            {
+                j++;
+            }
+
+            var group = sortedJobs.GetRange(i, j - i);
+            if (group.Count > 1)
+            {
+                group = SpatialSorter.SortByLayout(group, horizontalFirst);
+            }
+
+            result.AddRange(group);
+            i = j;
+        }
+
+        return result;
+    }
+
+    private static string GetSourceGroupKey(string? sourceFile)
+    {
+        if (string.IsNullOrWhiteSpace(sourceFile))
+        {
+            return "";
+        }
+
+        try
+        {
+            return Path.GetFullPath(sourceFile);
+        }
+        catch
+        {
+            return sourceFile!.Trim();
+        }
+    }
+
+    private static string GetSourceFileSortName(string sourceFileKey)
+    {
+        if (string.IsNullOrWhiteSpace(sourceFileKey))
+        {
+            return "";
+        }
+
+        try
+        {
+            return Path.GetFileName(sourceFileKey);
+        }
+        catch
+        {
+            return sourceFileKey;
+        }
     }
 
     private void RefreshDisplayRows()

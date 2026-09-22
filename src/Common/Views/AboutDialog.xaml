@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:ZwcadBatchPlot"
         Title="关于 LA批量打印"
-        Width="370" MinWidth="330" MinHeight="280"
+        Width="370" MinWidth="330"
         SizeToContent="Height"
         ResizeMode="NoResize" ShowInTaskbar="False"
         WindowStartupLocation="CenterScreen"

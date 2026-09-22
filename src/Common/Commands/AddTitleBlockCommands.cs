@@ -167,9 +167,15 @@ public sealed partial class BatchPlotCommands
                     out var frameSource))
             {
                 printExtents = TransformRegion(referenceFrame, blockTransform);
-                AddBlockLog(frameSource == BlockFrameSource.ClosedRectangle
-                    ? "Outer frame detected from the largest closed rectangle inside block."
-                    : "No closed rectangle found; outer frame detected from visible line geometry extents.");
+                AddBlockLog(frameSource switch
+                {
+                    BlockFrameSource.ClosedRectangle =>
+                        "Outer frame detected from the largest closed rectangle inside block.",
+                    BlockFrameSource.FourLineRectangle =>
+                        "Outer frame detected from four-line rectangle assembly inside block.",
+                    _ =>
+                        "No closed/four-line rectangle found; outer frame detected from visible line geometry extents."
+                });
             }
             else if (TryGetBlockExtents(doc.Database, blockResult.ObjectId, out var blockExtents))
             {

@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -7,6 +8,7 @@ using System.Windows;
 using System.Windows.Controls;
 #if AUTOCAD
 using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.PlottingServices;
 #if ACAD_CORE
 using CadApp = Autodesk.AutoCAD.ApplicationServices.Core.Application;
 #else
@@ -14,6 +16,7 @@ using CadApp = Autodesk.AutoCAD.ApplicationServices.Application;
 #endif
 #else
 using ZwSoft.ZwCAD.DatabaseServices;
+using ZwSoft.ZwCAD.PlottingServices;
 using CadApp = ZwSoft.ZwCAD.ApplicationServices.Application;
 #endif
 
@@ -225,8 +228,8 @@ internal static class PlotStyleManager
     }
 
     /**
-     * ResolveStylePath：按 CAD 当前打印样式搜索路径定位 CTB。
-     * 不拼默认 Plotters 目录；用户改过选项中的样式表路径后仍应能打开同一份文件。
+     * ResolveStylePath：向 CAD 要这份样式表的完整路径。
+     * 优先用 PlotConfigManager 的 FullPath（与下拉列表同源）；读不到时再按选项里的样式表搜索路径找文件。
      */
     private static string? ResolveStylePath(string styleSheet)
     {
@@ -245,13 +248,19 @@ internal static class PlotStyleManager
         }
         catch
         {
-            // 非法路径继续按文件名在 CAD 搜索路径中查找。
+            // 非法路径继续按文件名向 CAD 查询。
         }
 
         var fileName = NormalizeStyleName(raw);
         if (string.IsNullOrEmpty(fileName))
         {
             return null;
+        }
+
+        var fromPlotConfig = TryResolveStylePathFromPlotConfig(fileName);
+        if (!string.IsNullOrWhiteSpace(fromPlotConfig))
+        {
+            return fromPlotConfig;
         }
 
         foreach (var directory in AcadPlotterInstaller.GetPlotStyleSearchDirectories())
@@ -272,6 +281,94 @@ internal static class PlotStyleManager
 
         // 图纸目录等支持路径中的 CTB，CAD 打印时也能用；样式表搜索路径未包含时再问 FindFile。
         return TryFindStyleFileWithCad(fileName);
+    }
+
+    /**
+     * TryResolveStylePathFromPlotConfig：用 PlotConfigManager 取样式表完整路径。
+     * ColorDependentPlotStyles / NamedPlotStyles 与 GetPlotStyleSheetList 同源，FullPath 是 CAD 实际定位到的文件，不拼 Plotters 目录。
+     */
+    private static string? TryResolveStylePathFromPlotConfig(string fileName)
+    {
+        try
+        {
+            PlotConfigManager.RefreshList(RefreshCode.RefreshStyleList);
+        }
+        catch
+        {
+            // 刷新失败时仍读取当前已缓存的样式表列表。
+        }
+
+        try
+        {
+            var styles = fileName.EndsWith(".stb", StringComparison.OrdinalIgnoreCase)
+                ? PlotConfigManager.NamedPlotStyles
+                : PlotConfigManager.ColorDependentPlotStyles;
+
+            // 当前这套 API 的列表元素是字符串（文件名或完整路径）；若元素是 PlotConfigInfo，则用它的 FullPath。
+            foreach (var entry in (IEnumerable)styles)
+            {
+                if (entry is string text)
+                {
+                    var resolved = MatchExistingStyleFile(text, fileName);
+                    if (!string.IsNullOrWhiteSpace(resolved))
+                    {
+                        return resolved;
+                    }
+
+                    continue;
+                }
+
+                if (entry is PlotConfigInfo info)
+                {
+                    string? resolved = null;
+                    try
+                    {
+                        resolved = MatchExistingStyleFile(info.FullPath, fileName)
+                            ?? MatchExistingStyleFile(info.DeviceName, fileName);
+                    }
+                    catch
+                    {
+                        // 单条记录读失败时继续看下一条。
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(resolved))
+                    {
+                        return resolved;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // 当前宿主读不到样式表列表时，改走选项中的搜索路径。
+        }
+
+        return null;
+    }
+
+    /**
+     * MatchExistingStyleFile：条目与目标样式同名，且本身是已存在的绝对路径时返回该文件。
+     */
+    private static string? MatchExistingStyleFile(string? entry, string fileName)
+    {
+        if (string.IsNullOrWhiteSpace(entry) || !StyleNamesEqual(entry, fileName))
+        {
+            return null;
+        }
+
+        try
+        {
+            if (!Path.IsPathRooted(entry) || !File.Exists(entry))
+            {
+                return null;
+            }
+
+            return Path.GetFullPath(entry);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /** TryFindStyleFileWithCad：让当前 CAD 按自身支持文件搜索解析 CTB 文件名。 */
