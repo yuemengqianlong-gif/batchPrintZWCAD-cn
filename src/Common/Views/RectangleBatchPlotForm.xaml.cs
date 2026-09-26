@@ -193,6 +193,7 @@ public sealed partial class RectangleBatchPlotForm : Window
     private void ScanSelectedObjects_Click(object sender, RoutedEventArgs e) => ScanSelectedObjects();
 
     private void AddDwgFiles_Click(object sender, RoutedEventArgs e) => AddDwgFiles();
+    private void AddDwgFolder_Click(object sender, RoutedEventArgs e) => AddDwgFolder();
 
     private void ReloadFrames_Click(object sender, RoutedEventArgs e) => ReloadFrames();
 
@@ -870,7 +871,76 @@ public sealed partial class RectangleBatchPlotForm : Window
             .Select(Path.GetFullPath)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+        BeginMultiFileBatch(files);
+    }
+
+    /// <summary>选择文件夹，收集其中（含子文件夹）全部 DWG，后续流程与多文件批打相同。</summary>
+    private void AddDwgFolder()
+    {
+        using var dialog = new System.Windows.Forms.FolderBrowserDialog
+        {
+            Description = "选择包含 DWG 的文件夹（将包含子文件夹内的文件）",
+            ShowNewFolderButton = false
+        };
+        var seed = _outputDirectory.Text.Trim();
+        if (string.IsNullOrWhiteSpace(seed) || !Directory.Exists(seed))
+        {
+            seed = SourceDirectory();
+        }
+
+        if (!string.IsNullOrWhiteSpace(seed) && Directory.Exists(seed))
+        {
+            dialog.SelectedPath = seed;
+        }
+
+        if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK
+            || string.IsNullOrWhiteSpace(dialog.SelectedPath))
+        {
+            return;
+        }
+
+        List<string> files;
+        try
+        {
+            files = CollectDwgFilesInFolder(dialog.SelectedPath);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                "读取文件夹失败: " + ex.Message,
+                Title,
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            return;
+        }
+
         if (files.Count == 0)
+        {
+            MessageBox.Show(
+                "该文件夹内未找到 DWG 文件。",
+                Title,
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        BeginMultiFileBatch(files);
+    }
+
+    /// <summary>枚举文件夹及其子文件夹中的全部 .dwg（忽略大小写去重，按路径排序）。</summary>
+    private static List<string> CollectDwgFilesInFolder(string folder)
+    {
+        return Directory.EnumerateFiles(folder, "*.dwg", SearchOption.AllDirectories)
+            .Select(Path.GetFullPath)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    /// <summary>多文件批打核心：枚举空间 → 勾选 → 扫描入清单（文件选择与文件夹选择共用）。</summary>
+    private void BeginMultiFileBatch(IReadOnlyList<string> files)
+    {
+        if (files == null || files.Count == 0)
         {
             return;
         }
@@ -1835,7 +1905,18 @@ public sealed partial class RectangleBatchPlotForm : Window
         ApplyLeaveMarginSelection(selected);
         var originalPaths = selected.ToDictionary(job => job, job => job.OutputPath);
         string? temporaryDirectory = null;
-        var mergedOutput = Path.Combine(directory, SourceStem() + ".pdf");
+        var mergeStem = FileNameSanitizer.Clean(SourceStem());
+        if (string.IsNullOrWhiteSpace(mergeStem))
+        {
+            mergeStem = "合并图纸";
+        }
+        else
+        {
+            // 与单页 PDF 区分：合并件在源图名后加「_合并」。
+            mergeStem += "_合并";
+        }
+
+        var mergedOutput = Path.Combine(directory, mergeStem + ".pdf");
         var mergePdf = IsPdfOutput && _mergePdf.IsChecked == true;
         var mergedOutputPaths = new List<string>();
         var completed = 0;
@@ -1869,6 +1950,24 @@ public sealed partial class RectangleBatchPlotForm : Window
         var wasTopmost = Topmost;
         BatchPlotHostProgress.Begin();
         BatchPrintProgressSession? progress = null;
+        var progressUiClosed = false;
+
+        // 弹结束提示框前先关进度窗并恢复置顶：进度窗是 Topmost，若仍开着，
+        // 提示框可能被压在下面看不见，界面就像一直卡在“正在合并 PDF…”。finally 仍会兜底调用。
+        void CloseProgressUi()
+        {
+            if (progressUiClosed)
+            {
+                return;
+            }
+
+            progressUiClosed = true;
+            Topmost = wasTopmost;
+            progress?.Dispose();
+            progress = null;
+            BatchPlotHostProgress.End();
+        }
+
         try
         {
             // 切换按钮为"停止"状态
@@ -1912,7 +2011,7 @@ public sealed partial class RectangleBatchPlotForm : Window
                         $"第 {completed} / {selected.Count} 张\n" +
                         $"布局：{job.SpaceName}\n" +
                         $"输出：{System.IO.Path.GetFileName(finalOutput)}";
-                    progress.Report(completed, selected.Count, detail);
+                    progress?.Report(completed, selected.Count, detail);
                     AppendPrintLog(
                         "INFO",
                         $"开始打印 {completed}/{selected.Count}；源文件={job.SourceFile}；布局={job.SpaceName}；输出={finalOutput}");
@@ -1969,6 +2068,21 @@ public sealed partial class RectangleBatchPlotForm : Window
                 }
             }
 
+            _status.Text = $"完成，共 {selected.Count} 张";
+            AppendPrintLog("INFO", $"通用型批量打印完成；成功={selected.Count}；失败=0");
+            var printLogPath = SavePrintLog();
+            var printLogText = BuildLogText(printLogPath);
+            CloseProgressUi();
+            MessageBox.Show(
+                this,
+                mergePdf
+                    ? $"打印并合并完成，共 {selected.Count} 张，生成 {mergedOutputPaths.Count} 个 PDF。\n{string.Join("\n", mergedOutputPaths)}{printLogText}"
+                    : $"打印完成，共 {selected.Count} 张。\n{directory}{printLogText}",
+                Title,
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+
+            // 与图框批打一致：先弹完成提示，再打开合并 PDF / 输出目录，避免外部程序抢前台把提示框压到下面。
             if (mergePdf && _settings.OpenMergedPdfAfterMerge)
             {
                 OpenMergedPdfFiles(mergedOutputPaths);
@@ -1977,31 +2091,22 @@ public sealed partial class RectangleBatchPlotForm : Window
             {
                 RevealOutput(null, directory);
             }
-            _status.Text = $"完成，共 {selected.Count} 张";
-            AppendPrintLog("INFO", $"通用型批量打印完成；成功={selected.Count}；失败=0");
-            var printLogPath = SavePrintLog();
-            var printLogText = BuildLogText(printLogPath);
-            MessageBox.Show(
-                mergePdf
-                    ? $"打印并合并完成，共 {selected.Count} 张，生成 {mergedOutputPaths.Count} 个 PDF。\n{string.Join("\n", mergedOutputPaths)}{printLogText}"
-                    : $"打印完成，共 {selected.Count} 张。\n{directory}{printLogText}",
-                Title,
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
         }
         catch (OperationCanceledException)
         {
             _status.Text = $"已停止（已完成 {completed} / {selected.Count}）";
             AppendPrintLog("INFO", $"用户取消打印；已开始={completed}/{selected.Count}");
             var printLogPath = SavePrintLog();
-            MessageBox.Show($"打印已停止。\n已完成 {completed} / {selected.Count} 张。{BuildLogText(printLogPath)}", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+            CloseProgressUi();
+            MessageBox.Show(this, $"打印已停止。\n已完成 {completed} / {selected.Count} 张。{BuildLogText(printLogPath)}", Title, MessageBoxButton.OK, MessageBoxImage.Information);
         }
         catch (Exception ex)
         {
             _status.Text = "打印失败";
             AppendPrintLog("ERROR", "通用型批量打印失败: " + ex);
             var printLogPath = SavePrintLog();
-            MessageBox.Show("通用型批量打印失败: " + ex.Message + BuildLogText(printLogPath), Title, MessageBoxButton.OK, MessageBoxImage.Error);
+            CloseProgressUi();
+            MessageBox.Show(this, "通用型批量打印失败: " + ex.Message + BuildLogText(printLogPath), Title, MessageBoxButton.OK, MessageBoxImage.Error);
         }
         finally
         {
@@ -2011,10 +2116,7 @@ public sealed partial class RectangleBatchPlotForm : Window
             _printButton.Content = "开始打印";
             _printButton.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0, 120, 215));
             _printButton.BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0, 95, 170));
-            Topmost = wasTopmost;
-            progress?.Dispose();
-            progress = null;
-            BatchPlotHostProgress.End();
+            CloseProgressUi();
 
             foreach (var pair in originalPaths)
             {
@@ -2603,6 +2705,7 @@ public sealed partial class RectangleBatchPlotForm : Window
             _settings.CustomScales = updated.CustomScales;
             _settings.HideFrameBoundaryWhenPlotting = updated.HideFrameBoundaryWhenPlotting;
             _settings.PlotTransparency = updated.PlotTransparency;
+            _settings.PlotObjectLineweights = updated.PlotObjectLineweights;
             _settings.GeneratePrintLog = updated.GeneratePrintLog;
             _settings.ConvertTextToGeometryWhenPlotting = updated.ConvertTextToGeometryWhenPlotting;
             _settings.LongPaperSnapToleranceMm = updated.LongPaperSnapToleranceMm;
