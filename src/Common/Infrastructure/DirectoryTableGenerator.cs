@@ -31,7 +31,7 @@ public static class DirectoryTableGenerator
 
         if (GetEnabledColumns(settings).Count == 0)
         {
-            message = "图纸目录没有启用任何字段，请先在设置中启用目录列。";
+            message = "图纸目录没有启用任何字段，请先在设置中勾选目录列。";
             return false;
         }
 
@@ -43,12 +43,51 @@ public static class DirectoryTableGenerator
             return false;
         }
 
-        Generate(document, selected, settings, pointResult.Value);
-        message = $"已生成图纸目录，共 {selected.Count} 行。";
+        double breakHeight = 0;
+        if (settings.DirectoryAskTableBreak)
+        {
+            var distanceOptions = new PromptDistanceOptions("\n指定单栏最大高度以向右分栏(回车=不分栏): ")
+            {
+                AllowNone = true,
+                Only2d = true,
+                UseDefaultValue = false
+            };
+            var distanceResult = editor.GetDistance(distanceOptions);
+            if (distanceResult.Status == PromptStatus.Cancel)
+            {
+                message = "已取消生成目录。";
+                return false;
+            }
+
+            if (distanceResult.Status == PromptStatus.OK)
+            {
+                breakHeight = Math.Abs(distanceResult.Value);
+                if (breakHeight <= 1e-6)
+                {
+                    breakHeight = 0;
+                }
+            }
+        }
+
+        Generate(document, selected, settings, pointResult.Value, breakHeight);
+        if (breakHeight > 1e-6)
+        {
+            message = $"已生成图纸目录，共 {selected.Count} 行（已按高度 {breakHeight:0.##} 向右分栏，右栏重复表头）。";
+        }
+        else
+        {
+            message = $"已生成图纸目录，共 {selected.Count} 行。";
+        }
+
         return true;
     }
 
-    public static void Generate(Document document, IReadOnlyList<PlotJob> jobs, AppSettings settings, Point3d origin)
+    public static void Generate(
+        Document document,
+        IReadOnlyList<PlotJob> jobs,
+        AppSettings settings,
+        Point3d origin,
+        double breakHeight = 0)
     {
         var columns = GetEnabledColumns(settings);
         if (columns.Count == 0)
@@ -83,7 +122,7 @@ public static class DirectoryTableGenerator
             tb.SetSize(totalRows, totalCols);
             tb.GenerateLayout();
 
-            // 若表格默认带合并单元格，先行尝试取消合并
+            // 去掉默认带合并的标题单元格，改成普通表头行
             try
             {
                 if (tb.Cells[0, 0].IsMerged == true)
@@ -93,25 +132,22 @@ public static class DirectoryTableGenerator
             }
             catch { }
 
-            // 填充表头数据
+            // 写入表头内容
             if (settings.DirectoryDrawHeader)
             {
                 for (var col = 0; col < totalCols; col++)
                 {
-                    var cell = tb.Cells[0, col];
-                    var rawText = ToCadDirectoryText(columns[col].Header);
-                    // 1. 通过 \W{factor}; 格式化标签强制应用宽度因子
-                    cell.TextString = FormatTextWithWidthFactor(rawText, widthFactor);
-                    cell.TextHeight = textHeight;
-                    cell.Alignment = columns[col].Centered ? CellAlignment.MiddleCenter : CellAlignment.MiddleLeft;
-                    if (!textStyleId.IsNull)
-                    {
-                        cell.TextStyleId = textStyleId;
-                    }
+                    ApplyCellContent(
+                        tb.Cells[0, col],
+                        ToCadDirectoryText(columns[col].Header),
+                        textHeight,
+                        widthFactor,
+                        textStyleId,
+                        columns[col].Centered);
                 }
             }
 
-            // 填充图纸数据行
+            // 写入图纸数据行
             for (var r = 0; r < jobs.Count; r++)
             {
                 var tableRow = r + headerRows;
@@ -119,74 +155,90 @@ public static class DirectoryTableGenerator
                 {
                     var column = columns[col];
                     var value = GetColumnValue(column.Key, jobs[r], r, settings);
-                    var cell = tb.Cells[tableRow, col];
-                    var rawText = ToCadDirectoryText(value);
-
-                    // 1. 通过 \W{factor}; 格式化标签强制应用宽度因子
-                    cell.TextString = FormatTextWithWidthFactor(rawText, widthFactor);
-                    cell.TextHeight = textHeight;
-                    cell.Alignment = column.Centered ? CellAlignment.MiddleCenter : CellAlignment.MiddleLeft;
-                    if (!textStyleId.IsNull)
-                    {
-                        cell.TextStyleId = textStyleId;
-                    }
+                    ApplyCellContent(
+                        tb.Cells[tableRow, col],
+                        ToCadDirectoryText(value),
+                        textHeight,
+                        widthFactor,
+                        textStyleId,
+                        column.Centered);
                 }
             }
 
-            // 统一行高
-            for (var r = 0; r < totalRows; r++)
-            {
-                tb.Rows[r].Height = defaultRowHeight;
-            }
-
-            // 2. 自适应列宽算法（参考 TAD 中的 MText 测算逻辑）
-            var maxColWidths = new double[totalCols];
-            for (var col = 0; col < totalCols; col++)
-            {
-                for (var row = 0; row < totalRows; row++)
-                {
-                    var text = tb.Cells[row, col].TextString;
-                    if (string.IsNullOrEmpty(text)) continue;
-
-                    using (var mt = new MText())
-                    {
-                        mt.Contents = text;
-                        mt.TextHeight = textHeight;
-                        if (!textStyleId.IsNull) mt.TextStyleId = textStyleId;
-                        mt.Width = 0; // 不自动折行
-                        mt.LineSpacingFactor = 1.0;
-
-                        double actW = mt.ActualWidth;
-                        if (actW > maxColWidths[col])
-                        {
-                            maxColWidths[col] = actW;
-                        }
-                    }
-                }
-            }
-
-            // 内外边距设置
+            // 单元格边距（相对字高）——先设边距再定列宽/行高，便于按列宽测算换行高度
 #pragma warning disable 0618
+            double horizontalMargin = textHeight * 0.2;
+            double verticalMargin = textHeight * 0.1;
             try
             {
-                tb.HorizontalCellMargin = textHeight * 0.2;
-                tb.VerticalCellMargin = textHeight * 0.1;
+                tb.HorizontalCellMargin = horizontalMargin;
+                tb.VerticalCellMargin = verticalMargin;
             }
             catch { }
 #pragma warning restore 0618
 
-            // 左右安全 padding（单元格边距外再保留适度余量，防止贴线）
-            double absoluteColPadding = textHeight * 1.5;
-
+            // 严格使用设置列宽（图面单位），不再按文字实测撑宽
             for (var c = 0; c < totalCols; c++)
             {
-                double autoFitWidth = maxColWidths[c] + absoluteColPadding;
-                // 若设置中有预设列宽，则取预设值与文字自适应所需宽度的较大者，保证装得下
-                double configuredWidth = columns[c].Width;
-                tb.Columns[c].Width = Math.Max(configuredWidth, autoFitWidth);
+                tb.Columns[c].Width = Math.Max(1, columns[c].Width);
             }
 
-            // 如果设置不绘制网格线，隐藏内外网格线
+            // 按列宽测算换行后所需行高（ZWCAD 的 Row.MinimumHeight 只读，不能靠它长高）
+            for (var r = 0; r < totalRows; r++)
+            {
+                var needed = defaultRowHeight;
+                for (var c = 0; c < totalCols; c++)
+                {
+                    var cellText = tb.Cells[r, c].TextString;
+                    if (string.IsNullOrEmpty(cellText))
+                    {
+                        continue;
+                    }
+
+                    var contentWidth = Math.Max(1, tb.Columns[c].Width - horizontalMargin * 2);
+                    using (var mt = new MText())
+                    {
+                        mt.Contents = cellText;
+                        mt.TextHeight = textHeight;
+                        if (!textStyleId.IsNull)
+                        {
+                            mt.TextStyleId = textStyleId;
+                        }
+
+                        mt.Width = contentWidth;
+                        mt.LineSpacingFactor = 1.0;
+                        var actH = mt.ActualHeight + verticalMargin * 2;
+                        if (actH > needed)
+                        {
+                            needed = actH;
+                        }
+                    }
+                }
+
+                tb.Rows[r].Height = needed;
+            }
+
+            // 可选分栏：向右排第二栏，并重复顶行表头
+            if (breakHeight > 1e-6)
+            {
+                tb.BreakEnabled = true;
+                tb.BreakOptions =
+                    TableBreakOptions.EnableBreaking |
+                    TableBreakOptions.RepeatTopLabels;
+                tb.BreakFlowDirection = TableBreakFlowDirection.Right;
+                tb.SetBreakHeight(0, breakHeight);
+                try
+                {
+                    tb.SetBreakSpacing(Math.Max(textHeight, defaultRowHeight * 0.5));
+                }
+                catch { }
+            }
+            else
+            {
+                tb.BreakEnabled = false;
+            }
+
+            // 不画网格线时隐藏边框
             if (!settings.DirectoryDrawGridLines)
             {
                 try
@@ -208,10 +260,48 @@ public static class DirectoryTableGenerator
             tb.GenerateLayout();
             try { tb.RecomputeTableBlock(true); } catch { }
 
+            // 换行后若仍低于保底行高则抬回；Recompute 后以实际高度为准，避免裁切
+            try
+            {
+                for (var r = 0; r < totalRows; r++)
+                {
+                    if (tb.Rows[r].Height < defaultRowHeight - 1e-6)
+                    {
+                        tb.Rows[r].Height = defaultRowHeight;
+                    }
+                }
+
+                tb.RecomputeTableBlock(true);
+            }
+            catch { }
+
             space.AppendEntity(tb);
             tr.AddNewlyCreatedDBObject(tb, true);
 
             tr.Commit();
+        }
+    }
+
+    private static void ApplyCellContent(
+        Cell cell,
+        string rawText,
+        double textHeight,
+        double widthFactor,
+        ObjectId textStyleId,
+        bool centered)
+    {
+        cell.TextString = FormatTextWithWidthFactor(rawText, widthFactor);
+        cell.TextHeight = textHeight;
+        cell.Alignment = centered ? CellAlignment.MiddleCenter : CellAlignment.MiddleLeft;
+        try
+        {
+            cell.ContentLayout = CellContentLayout.Flow;
+        }
+        catch { }
+
+        if (!textStyleId.IsNull)
+        {
+            cell.TextStyleId = textStyleId;
         }
     }
 
@@ -249,7 +339,7 @@ public static class DirectoryTableGenerator
         var width = Math.Abs(second.Value.X - first.Value.X);
         if (width <= 1e-6)
         {
-            message = "框选区域的宽度为 0，目录列宽未修改。";
+            message = "框选得到的宽度为 0，目录列宽未修改。";
             return false;
         }
 
@@ -281,7 +371,7 @@ public static class DirectoryTableGenerator
         var height = Math.Abs(result.Value);
         if (height <= 1e-6)
         {
-            message = "量取的目录行高为 0，设置未修改。";
+            message = "点取的目录行高为 0，设置未修改。";
             return false;
         }
 
@@ -310,7 +400,7 @@ public static class DirectoryTableGenerator
 
         try
         {
-            var options = new PromptEntityOptions("\n点选一段文字作为图纸目录文字样式: ");
+            var options = new PromptEntityOptions("\n点选一个文字作为图纸目录文字样式: ");
             options.SetRejectMessage("\n请选择单行文字、多行文字或属性文字。");
             options.AddAllowedClass(typeof(DBText), false);
             options.AddAllowedClass(typeof(MText), false);
@@ -379,7 +469,7 @@ public static class DirectoryTableGenerator
             AppSettingsStore.Save(settings);
             updated = settings;
             message =
-                $"已从所选文字读取目录样式：颜色 {settings.DirectoryColorIndex}，" +
+                $"已从选中文字读取目录样式：颜色 {settings.DirectoryColorIndex}，" +
                 $"字高 {settings.DirectoryTextHeight:0.##}，宽度因子 {settings.DirectoryTextWidthFactor:0.##}，" +
                 $"文字样式“{(string.IsNullOrWhiteSpace(settings.DirectoryTextStyleName) ? "默认" : settings.DirectoryTextStyleName)}”，" +
                 $"图层“{settings.DirectoryLayerName}”。";
@@ -387,12 +477,12 @@ public static class DirectoryTableGenerator
         }
         catch (Exception ex)
         {
-            message = "点选目录文字样式失败，请确认当前活动图纸仍然打开：" + ex.Message;
+            message = "点选目录文字样式失败，请确认当前活动图纸然后重试：" + ex.Message;
             return false;
         }
     }
 
-    /// <summary>显式保存目录设置；失败时返回提示文本，由调用方弹窗告知用户。</summary>
+    /// <summary>持久化目录设置；失败时返回提示文本，由调用方弹窗告知用户。</summary>
     private static bool TrySaveSettings(AppSettings settings, out string message)
     {
         try
@@ -441,7 +531,7 @@ public static class DirectoryTableGenerator
     }
 
     /// <summary>
-    /// 为文本增加 MText 宽度因子格式控制符，确保单元格严格执行该因子
+    /// 为表格内的 MText 内容加宽度因子格式码，确保单元格严格执行该因子。
     /// </summary>
     private static string FormatTextWithWidthFactor(string text, double factor)
     {
@@ -498,7 +588,7 @@ public static class DirectoryTableGenerator
             {
                 Name = styleName,
                 FileName = "simsun.ttc",
-                XScale = widthFactor // TextStyle 级别同步设置 XScale
+                XScale = widthFactor // TextStyle 层面同步写入 XScale
             };
             var id = table.Add(record);
             tr.AddNewlyCreatedDBObject(record, true);

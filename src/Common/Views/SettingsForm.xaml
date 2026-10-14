@@ -289,7 +289,9 @@
 
                             <StackPanel Grid.Column="0" Grid.Row="1" Grid.ColumnSpan="6" Orientation="Horizontal" Margin="0,6,0,0">
                                 <CheckBox x:Name="_directoryDrawHeader" Content="绘制目录表头" Margin="0,0,16,0" />
-                                <CheckBox x:Name="_directoryDrawGridLines" Content="绘制目录框线" />
+                                <CheckBox x:Name="_directoryDrawGridLines" Content="绘制目录框线" Margin="0,0,16,0" />
+                                <CheckBox x:Name="_directoryAskTableBreak" Content="生成时询问分栏高度"
+                                          ToolTip="开启后，生成目录时会点取单栏最大高度（图面单位）；表格向右分栏且右栏重复表头。回车可跳过。默认关闭。" />
                             </StackPanel>
                         </Grid>
                     </GroupBox>
@@ -376,7 +378,7 @@
                                 </DataGrid.Columns>
                             </DataGrid>
 
-                            <TextBlock Grid.Row="1" Text="顺序预览（按实际列宽、行高和字高等比例缩放）"
+                            <TextBlock Grid.Row="1" Text="列宽为图面单位，生成时严格按设定值（长文在格内换行）；顺序预览按设定列宽/行高/字高比例绘制："
                                        VerticalAlignment="Bottom" Foreground="DimGray" />
                             <local:DirectoryPreviewControl x:Name="_directoryOrderPreview" Grid.Row="2" Margin="0,2,0,0" />
                         </Grid>

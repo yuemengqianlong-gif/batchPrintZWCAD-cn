@@ -31,6 +31,10 @@ public static class CadTextExtractor
         internal IReadOnlyList<OverlapBlockRef> OverlapBlocks { get; }
     }
 
+    /// <summary>空文字缓存。缓存建立彻底失败时用它代替 null，避免每个字段区域都重新遍历整张图。</summary>
+    public static OwnerTextCache EmptyOwnerTextCache()
+        => new(new TextCandidate[0], new OverlapBlockRef[0]);
+
     /// <summary>布局中一个块参照的包围盒快照，与建立缓存的事务共用。</summary>
     internal readonly struct OverlapBlockRef
     {
@@ -128,7 +132,21 @@ public static class CadTextExtractor
 
     public static string GetBlockName(BlockReference blockRef, Transaction tr)
     {
-        var definitionId = blockRef.BlockTableRecord;
+        ObjectId definitionId;
+        try
+        {
+            definitionId = blockRef.BlockTableRecord;
+        }
+        catch
+        {
+            return "";
+        }
+
+        if (definitionId.IsNull)
+        {
+            // 损坏图纸中块定义丢失的 INSERT：没有名字可取，按空名处理。
+            return "";
+        }
         try
         {
             if (blockRef.IsDynamicBlock && !blockRef.DynamicBlockTableRecord.IsNull)
@@ -147,8 +165,16 @@ public static class CadTextExtractor
             return cachedName;
         }
 
-        var btr = (BlockTableRecord)tr.GetObject(definitionId, OpenMode.ForRead);
-        var name = btr.Name;
+        string name;
+        try
+        {
+            name = tr.GetObject(definitionId, OpenMode.ForRead, false) is BlockTableRecord btr ? btr.Name : "";
+        }
+        catch
+        {
+            name = "";
+        }
+
         if (TitleBlockScanCaches.Active)
         {
             TitleBlockScanCaches.BlockNames[definitionId] = name;
@@ -380,47 +406,71 @@ public static class CadTextExtractor
         var overlapBlocks = new List<OverlapBlockRef>();
         foreach (ObjectId id in owner)
         {
-            if (tr.GetObject(id, OpenMode.ForRead, false) is not Entity entity)
+            // 单个实体出错（损坏块参照、代理对象等）只跳过它自己，不能让整张图的文字缓存失效。
+            try
             {
-                continue;
+                AddOwnerEntityToCache(tr, id, libraryBlockNames, includeBlockNames, values, overlapBlocks);
             }
-
-            if (!IsEntityVisible(entity))
+            catch
             {
-                continue;
-            }
-
-            if (entity is BlockReference ownerBlock)
-            {
-                try
-                {
-                    overlapBlocks.Add(new OverlapBlockRef(id, ownerBlock.GeometricExtents, ownerBlock));
-                }
-                catch
-                {
-                }
-
-                if (!IsBlockClipped(tr, ownerBlock))
-                {
-                    // 若提供了库名列表，只递归遍历匹配的块，大幅减少无意义遍历
-                    if (libraryBlockNames == null || libraryBlockNames.Contains(GetBlockName(ownerBlock, tr)))
-                    {
-                        CollectOwnerBlockTextForCache(tr, ownerBlock, values, includeBlockNames);
-                    }
-                }
-                continue;
-            }
-
-            if (TryGetOwnerSpaceText(entity, out var text, out var worldPoint))
-            {
-                var priority = entity is AttributeDefinition or AttributeReference
-                    ? TextSourcePriority.Attribute
-                    : TextSourcePriority.OwnerSpace;
-                AddText(values, text, worldPoint, priority);
             }
         }
 
         return new OwnerTextCache(values, overlapBlocks);
+    }
+
+    private static void AddOwnerEntityToCache(
+        Transaction tr,
+        ObjectId id,
+        HashSet<string>? libraryBlockNames,
+        bool includeBlockNames,
+        List<TextCandidate> values,
+        List<OverlapBlockRef> overlapBlocks)
+    {
+        if (tr.GetObject(id, OpenMode.ForRead, false) is not Entity entity)
+        {
+            return;
+        }
+
+        if (!IsEntityVisible(entity))
+        {
+            return;
+        }
+
+        if (entity is BlockReference ownerBlock)
+        {
+            if (!ScanCandidateFilter.HasValidDefinition(ownerBlock))
+            {
+                return;
+            }
+
+            try
+            {
+                overlapBlocks.Add(new OverlapBlockRef(id, ownerBlock.GeometricExtents, ownerBlock));
+            }
+            catch
+            {
+            }
+
+            if (!IsBlockClipped(tr, ownerBlock))
+            {
+                // 若提供了库名列表，只递归遍历匹配的块，大幅减少无意义遍历
+                if (libraryBlockNames == null || libraryBlockNames.Contains(GetBlockName(ownerBlock, tr)))
+                {
+                    CollectOwnerBlockTextForCache(tr, ownerBlock, values, includeBlockNames);
+                }
+            }
+
+            return;
+        }
+
+        if (TryGetOwnerSpaceText(entity, out var text, out var worldPoint))
+        {
+            var priority = entity is AttributeDefinition or AttributeReference
+                ? TextSourcePriority.Attribute
+                : TextSourcePriority.OwnerSpace;
+            AddText(values, text, worldPoint, priority);
+        }
     }
 
     private static bool TryGetOwnerSpaceText(Entity entity, out string text, out Point3d point)
@@ -514,7 +564,7 @@ public static class CadTextExtractor
         {
             AppendCachedCandidates(values, blockTextCache.DefinitionCandidates, blockLocal, region);
         }
-        else
+        else if (ScanCandidateFilter.HasValidDefinition(blockRef))
         {
             var definition = (BlockTableRecord)tr.GetObject(blockRef.BlockTableRecord, OpenMode.ForRead);
             CollectDefinitionText(
@@ -689,20 +739,7 @@ public static class CadTextExtractor
     private static bool TryGetOwnerBlockName(BlockReference blockRef, Transaction tr, out string blockName)
     {
         blockName = GetBlockName(blockRef, tr);
-        if (string.IsNullOrWhiteSpace(blockName))
-        {
-            return false;
-        }
-
-        var trimmed = blockName.Trim();
-        if (trimmed.StartsWith("*", StringComparison.Ordinal)
-            || trimmed.StartsWith("A$C", StringComparison.OrdinalIgnoreCase)
-            || trimmed.IndexOf("$0$", StringComparison.OrdinalIgnoreCase) >= 0)
-        {
-            return false;
-        }
-
-        return true;
+        return BlockNameRules.IsReadableOwnerBlockName(blockName);
     }
 
     /// <summary>
@@ -890,7 +927,8 @@ public static class CadTextExtractor
                 continue;
             }
 
-            if (tr.GetObject(id, OpenMode.ForRead, false) is not BlockReference otherBlock)
+            if (tr.GetObject(id, OpenMode.ForRead, false) is not BlockReference otherBlock
+                || !ScanCandidateFilter.HasValidDefinition(otherBlock))
             {
                 continue;
             }

@@ -41,7 +41,28 @@ internal static class ScanCandidateFilter
 
     /// <summary>判断对象是否为图框块扫描候选（块参照）。</summary>
     /// <param name="obj">事务内打开的数据库对象。</param>
-    public static bool IsTitleBlockCandidate(DBObject? obj) => obj is BlockReference;
+    public static bool IsTitleBlockCandidate(DBObject? obj) => obj is BlockReference blockRef && HasValidDefinition(blockRef);
+
+    /// <summary>
+    /// 块参照是否指向有效块定义。损坏图纸里可能有 BlockTableRecord 为空的 INSERT，
+    /// 打开其定义会抛 eNullObjectId；这类对象一律不当作候选，避免拖垮整次扫描。
+    /// </summary>
+    public static bool HasValidDefinition(BlockReference? blockRef)
+    {
+        if (blockRef == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            return !blockRef.BlockTableRecord.IsNull;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>
     /// 判断对象是否为矩形图框扫描候选（块参照 / 多段线；可选直线）。
@@ -50,7 +71,12 @@ internal static class ScanCandidateFilter
     /// <param name="includeLines">是否把直线视为候选。</param>
     public static bool IsRectangleFrameCandidate(DBObject? obj, bool includeLines)
     {
-        if (obj is BlockReference or Polyline or Polyline2d or Polyline3d)
+        if (obj is BlockReference blockRef)
+        {
+            return HasValidDefinition(blockRef);
+        }
+
+        if (obj is Polyline or Polyline2d or Polyline3d)
         {
             return true;
         }

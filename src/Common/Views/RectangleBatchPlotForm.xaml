@@ -2,7 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:ZwcadBatchPlot"
         x:Class="ZwcadBatchPlot.RectangleBatchPlotForm"
-        Title="LA通用型批量打印 V1.15.8"
+        Title="LA通用型批量打印 V1.15.9"
         Width="900" Height="520"
         MinWidth="720" MinHeight="460"
         WindowStartupLocation="CenterScreen"
@@ -48,6 +48,10 @@
                         Style="{StaticResource PluginButtonStyle}" Margin="0,0,4,0"
                         Click="FileNameSettings_Click"
                         ToolTip="配置输出文件名格式、序号位数等（与图框型共用）；通用型仅对识别到图号/图名的图纸套用规则，其余仍为 DWG名+序号。" />
+                <Button x:Name="_directorySettingsBtn" Content="目录设置" MinWidth="80"
+                        Style="{StaticResource PluginButtonStyle}" Margin="0,0,4,0"
+                        Click="DirectorySettings_Click"
+                        ToolTip="设置图纸目录列宽、行高等，直接跳转到目录标签页。" />
                 <Button x:Name="_generalSettingsBtn" Content="常规设置" MinWidth="76"
                         Style="{StaticResource PluginButtonStyle}"
                         Click="GeneralSettings_Click"
@@ -87,6 +91,10 @@
                         Style="{StaticResource PluginButtonStyle}" Margin="0,0,3,0"
                         Click="ClearRows_Click"
                         ToolTip="清空当前矩形框清单，不影响 CAD 文件。" />
+                <Button x:Name="_generateDirectoryBtn" Content="生成目录" MinWidth="92"
+                        Style="{StaticResource PluginButtonStyle}" Margin="0,0,3,0"
+                        Click="GenerateDrawingDirectory_Click"
+                        ToolTip="在当前 CAD 指定基点，生成图纸目录表格。" />
             </StackPanel>
 
             <!-- 输出行：输出目录 / 浏览 / 输出格式 / CTB / 设置 / 开始打印 -->

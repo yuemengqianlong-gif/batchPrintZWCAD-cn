@@ -1193,6 +1193,7 @@ public sealed partial class SettingsForm : Window
         _directoryLayerName.Text = settings.DirectoryLayerName;
         _directoryDrawHeader.IsChecked = settings.DirectoryDrawHeader;
         _directoryDrawGridLines.IsChecked = settings.DirectoryDrawGridLines;
+        _directoryAskTableBreak.IsChecked = settings.DirectoryAskTableBreak;
         SelectTextStyle(settings.DirectoryTextStyleName);
         LoadDirectoryColumns(settings.DirectoryColumns);
         _longPaperNameFormat.SelectedIndex = Math.Max(0, Math.Min(5, (int)settings.LongPaperNameFormat));
@@ -1283,6 +1284,7 @@ public sealed partial class SettingsForm : Window
         current.DirectoryLayerName = string.IsNullOrWhiteSpace(_directoryLayerName.Text) ? "0" : _directoryLayerName.Text.Trim();
         current.DirectoryDrawHeader = _directoryDrawHeader.IsChecked == true;
         current.DirectoryDrawGridLines = _directoryDrawGridLines.IsChecked == true;
+        current.DirectoryAskTableBreak = _directoryAskTableBreak.IsChecked == true;
         current.DirectoryColumns = directoryColumns;
         current.LongPaperNameFormat = (LongPaperNameFormat)Math.Max(0, Math.Min(5, _longPaperNameFormat.SelectedIndex));
         current.LongPaperSnapToleranceMm = _longPaperSnapTolerance.Value;

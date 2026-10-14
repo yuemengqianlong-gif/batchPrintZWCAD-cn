@@ -52,11 +52,22 @@ public sealed partial class RectangleBatchPlotForm : Window
         public event PropertyChangedEventHandler? PropertyChanged;
 
         public PlotJob Job { get; set; } = new();
-        public IReadOnlyList<PaperDetection> Options { get; set; } = new PaperDetection[0];
+        private IReadOnlyList<PaperDetection> _options = new PaperDetection[0];
+        private IReadOnlyList<string> _paperOptions = new string[0];
+
+        public IReadOnlyList<PaperDetection> Options
+        {
+            get => _options;
+            set
+            {
+                _options = value ?? new PaperDetection[0];
+                // 下拉候选只在纸张候选变化时格式化一次；滚动时虚拟化行反复绑定不再重复生成列表。
+                _paperOptions = _options.Select(PaperSizeDetector.FormatOption).ToList();
+            }
+        }
 
         /// <summary>纸张下拉候选（原 DataGridViewComboBoxCell.DataSource 语义）。</summary>
-        public IReadOnlyList<string> PaperOptions =>
-            Options.Select(PaperSizeDetector.FormatOption).ToList();
+        public IReadOnlyList<string> PaperOptions => _paperOptions;
 
         public bool Selected
         {
@@ -127,6 +138,10 @@ public sealed partial class RectangleBatchPlotForm : Window
     private readonly TemporarySequenceOverlay _overlay;
     /// <summary>CAD 红框高亮的任务；按引用保存，表头排序或删行后不会错位。</summary>
     private PlotJob? _highlightedJob;
+    /// <summary>防抖后最近一次真正写入 CAD 的高亮任务；同一行重复触发时跳过 CAD 刷新。</summary>
+    private PlotJob? _appliedHighlightJob;
+    /// <summary>行切换高亮防抖：键盘连按 / 滚动选择时只在停下约 120ms 后刷新一次 CAD。</summary>
+    private DispatcherTimer? _highlightTimer;
     private int _overlayScheduleGeneration;
     private readonly BindingList<Row> _rows = new();
     private readonly BindingList<Row> _displayRows = new();
@@ -180,6 +195,7 @@ public sealed partial class RectangleBatchPlotForm : Window
     protected override void OnClosed(EventArgs e)
     {
         _overlayScheduleGeneration++;
+        _highlightTimer?.Stop();
         // 关闭窗口时只清理临时红框和序号，不再退订或接管 CAD 删除命令。
         _overlay.Dispose();
         base.OnClosed(e);
@@ -219,6 +235,8 @@ public sealed partial class RectangleBatchPlotForm : Window
         _lastScanScope = null;
         _hasAttributeIdentity = false;
         _highlightedJob = null;
+        _appliedHighlightJob = null;
+        _highlightTimer?.Stop();
         UpdateAttributeIdentityColumns();
         _viewSortedByHeader = false;
         _sortMemberPath = "";
@@ -268,7 +286,6 @@ public sealed partial class RectangleBatchPlotForm : Window
         }
 
         UpdateOutputFormatUi();
-        SchedulePlotWarmUp();
     }
 
     private void Style_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -277,7 +294,6 @@ public sealed partial class RectangleBatchPlotForm : Window
         if (_styleSelectionReady)
         {
             SaveCurrentPlotOptions();
-            SchedulePlotWarmUp();
         }
     }
 
@@ -466,9 +482,39 @@ public sealed partial class RectangleBatchPlotForm : Window
         // 打印期间不改 CAD 实体，避免与出图引擎争用文档；打印结束后在 finally 中补一次。
         if (_printCts != null)
         {
+            _highlightTimer?.Stop();
             return;
         }
 
+        if (_highlightTimer == null)
+        {
+            _highlightTimer = new DispatcherTimer(DispatcherPriority.Background, Dispatcher)
+            {
+                Interval = TimeSpan.FromMilliseconds(120)
+            };
+            _highlightTimer.Tick += HighlightTimer_Tick;
+        }
+
+        // 重新计时：连续切换行时只刷新最后停下的那一行。
+        _highlightTimer.Stop();
+        _highlightTimer.Start();
+    }
+
+    private void HighlightTimer_Tick(object? sender, EventArgs e)
+    {
+        _highlightTimer?.Stop();
+        if (_printCts != null)
+        {
+            return;
+        }
+
+        var job = _highlightedJob;
+        if (job == null || ReferenceEquals(job, _appliedHighlightJob))
+        {
+            return;
+        }
+
+        _appliedHighlightJob = job;
         _overlay.SetHighlight(job);
     }
 
@@ -543,10 +589,22 @@ public sealed partial class RectangleBatchPlotForm : Window
             return;
         }
 
+        // 表格整体重建（删除 / 不打印 / 排序 / 滚动出新行）时，下拉框重新绑定 SelectedItem 也会触发本事件。
+        // 只有用户真正在操作下拉框、且纸张确实变了才处理，否则主导模式下每个可见行都会重识别图名图号。
+        var comboBox = (ComboBox)sender;
+        var userInteracting = comboBox.IsDropDownOpen || comboBox.IsKeyboardFocusWithin;
+        if (!PaperChoiceChangeRules.ShouldHandleSelectionChange(e.RemovedItems.Count, userInteracting))
+        {
+            return;
+        }
+
         // 对应原 GridCellValueChanged 的 PaperChoice 分支。
         var value = row.PaperChoice;
         var option = row.Options.FirstOrDefault(candidate => string.Equals(PaperSizeDetector.FormatOption(candidate), value, StringComparison.Ordinal));
-        if (option != null)
+        if (option != null
+            && !PaperChoiceChangeRules.IsSamePaper(
+                row.Job.PaperName, row.Job.ScaleText, row.Job.PaperWidthMm, row.Job.PaperHeightMm, row.Job.RequiresCustomPaperRegistration,
+                option.PaperName, option.ScaleText, option.PaperWidthMm, option.PaperHeightMm, option.RequiresCustomPaper))
         {
             ApplyPaper(row.Job, option);
             row.RefreshFromJob();
@@ -1427,10 +1485,23 @@ public sealed partial class RectangleBatchPlotForm : Window
     }
 
     /// <summary>
-    /// 通用型排序：多文件时先按文件名；同一文件内有识别图号则按图号，否则与单文件批打相同（布局 + 空间位置）。
+    /// 通用型排序：仅当智能识别已填图号/图名（属性身份模式）时，跨文件全局按图号→图名→空间断平局；
+    /// 否则保持按源文件分组后的空间/布局顺序（不强制图号排序）。
     /// </summary>
     private List<Row> SortRectangleRows(IReadOnlyList<Row> rows)
     {
+        if (rows.Count <= 1)
+        {
+            return rows.ToList();
+        }
+
+        if (_hasAttributeIdentity)
+        {
+            // 有识别图号/图名：跨文件全局排序，禁止先按源文件名分组（否则会出现 003…012 排在 000 前）
+            return SortRowsByDrawingNumberGlobally(rows);
+        }
+
+        // 无图号图名识别：按源文件分组，组内与单文件批打相同（布局 + 空间位置）
         var result = new List<Row>(rows.Count);
         var sourceGroups = rows
             .Select((row, index) => new { Row = row, Index = index })
@@ -1442,17 +1513,35 @@ public sealed partial class RectangleBatchPlotForm : Window
         foreach (var sourceGroup in sourceGroups)
         {
             var fileRows = sourceGroup.Select(item => item.Row).ToList();
-            result.AddRange(SortRowsWithinSourceFile(fileRows));
+            result.AddRange(SortRowsSpatiallyWithinSourceFile(fileRows));
         }
 
         return result;
     }
 
     /// <summary>
-    /// 单文件内排序：有识别图号（属性身份模式）时按图号自然序，同图号再用单文件空间序打断平局；
-    /// 否则直接按单文件打印顺序（SpatialSorter.SortByLayout）。
+    /// 属性身份模式：全局按图号自然序 → 图名 → 同号同名再空间断平局；空图号沉到清单末尾。
     /// </summary>
-    private List<Row> SortRowsWithinSourceFile(List<Row> fileRows)
+    private List<Row> SortRowsByDrawingNumberGlobally(IReadOnlyList<Row> rows)
+    {
+        var jobToRow = rows.ToDictionary(row => row.Job, row => row);
+        var byDrawingNumber = rows
+            .OrderBy(row => IsBlankIdentity(row.Job.DrawingNumber) ? 1 : 0)
+            .ThenBy(row => row.Job.DrawingNumber ?? "", NaturalStringComparer.Instance)
+            .ThenBy(row => IsBlankIdentity(row.Job.Title) ? 1 : 0)
+            .ThenBy(row => row.Job.Title ?? "", StringComparer.CurrentCultureIgnoreCase)
+            .Select(row => row.Job)
+            .ToList();
+
+        return SpatiallyBreakTiesAcrossFiles(byDrawingNumber)
+            .Select(job => jobToRow[job])
+            .ToList();
+    }
+
+    /// <summary>
+    /// 无属性身份时：单源文件内按布局 + 空间位置排序。
+    /// </summary>
+    private List<Row> SortRowsSpatiallyWithinSourceFile(List<Row> fileRows)
     {
         if (fileRows.Count <= 1)
         {
@@ -1461,29 +1550,16 @@ public sealed partial class RectangleBatchPlotForm : Window
 
         var horizontalFirst = _settings.SortOrderHorizontalFirst;
         var jobToRow = fileRows.ToDictionary(row => row.Job, row => row);
-
-        if (_hasAttributeIdentity)
-        {
-            var byDrawingNumber = fileRows
-                .OrderBy(row => row.Job.DrawingNumber ?? "", NaturalStringComparer.Instance)
-                .ThenBy(row => row.Job.Title ?? "", StringComparer.CurrentCultureIgnoreCase)
-                .Select(row => row.Job)
-                .ToList();
-
-            return SpatiallyBreakTiesWithinFile(byDrawingNumber)
-                .Select(job => jobToRow[job])
-                .ToList();
-        }
-
         return SpatialSorter.SortByLayout(fileRows.Select(row => row.Job).ToList(), horizontalFirst)
             .Select(job => jobToRow[job])
             .ToList();
     }
 
     /// <summary>
-    /// 图号（及图名）完全相同的连续段内，按单文件空间顺序二次排序。
+    /// 对已按（图号, 图名）排序的列表，在图号和图名完全相同的连续段内按空间位置二次排序。
+    /// 不同 DWG 坐标系互不相关，同号同名段内仍按源文件分开再空间排序。
     /// </summary>
-    private List<PlotJob> SpatiallyBreakTiesWithinFile(List<PlotJob> sortedJobs)
+    private List<PlotJob> SpatiallyBreakTiesAcrossFiles(List<PlotJob> sortedJobs)
     {
         if (sortedJobs.Count <= 1)
         {
@@ -1507,7 +1583,7 @@ public sealed partial class RectangleBatchPlotForm : Window
             var group = sortedJobs.GetRange(i, j - i);
             if (group.Count > 1)
             {
-                group = SpatialSorter.SortByLayout(group, horizontalFirst);
+                group = SortSpatialWithinSourceFiles(group, horizontalFirst);
             }
 
             result.AddRange(group);
@@ -1516,6 +1592,32 @@ public sealed partial class RectangleBatchPlotForm : Window
 
         return result;
     }
+
+    /// <summary>
+    /// 同号同名段内：按源文件名自然序分组，各组内再 SpatialSorter.SortByLayout。
+    /// </summary>
+    private List<PlotJob> SortSpatialWithinSourceFiles(List<PlotJob> jobs, bool horizontalFirst)
+    {
+        var result = new List<PlotJob>(jobs.Count);
+        var sourceGroups = jobs
+            .Select((job, index) => new { Job = job, Index = index })
+            .GroupBy(item => GetSourceGroupKey(item.Job.SourceFile), StringComparer.OrdinalIgnoreCase)
+            .OrderBy(group => GetSourceFileSortName(group.Key), NaturalStringComparer.Instance)
+            .ThenBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(group => group.Min(item => item.Index));
+
+        foreach (var sourceGroup in sourceGroups)
+        {
+            result.AddRange(SpatialSorter.SortByLayout(
+                sourceGroup.Select(item => item.Job).ToList(),
+                horizontalFirst));
+        }
+
+        return result;
+    }
+
+    /// <summary>图号/图名为空或仅空白时视为未识别，排序时沉到清单末尾。</summary>
+    private static bool IsBlankIdentity(string? value) => string.IsNullOrWhiteSpace(value);
 
     private static string GetSourceGroupKey(string? sourceFile)
     {
@@ -1790,6 +1892,8 @@ public sealed partial class RectangleBatchPlotForm : Window
             return;
         }
 
+        var beforeKeys = CaptureIdentitySortKeys();
+
         foreach (var group in list.GroupBy(row => row.Job.SourceFile ?? "", StringComparer.OrdinalIgnoreCase))
         {
             var jobs = group.Select(row => row.Job).ToList();
@@ -1827,6 +1931,46 @@ public sealed partial class RectangleBatchPlotForm : Window
         {
             row.RefreshFromJob();
         }
+
+        // 改纸后图号/图名或是否具备识别属性可能变化，按当前规则重排清单。
+        var afterKeys = CaptureIdentitySortKeys();
+        if (hadIdentity != _hasAttributeIdentity || !IdentitySortKeysEqual(beforeKeys, afterKeys))
+        {
+            SortRows();
+        }
+    }
+
+    private List<(string DrawingNumber, string Title)> CaptureIdentitySortKeys()
+    {
+        var keys = new List<(string DrawingNumber, string Title)>(_rows.Count);
+        foreach (var row in _rows)
+        {
+            var job = row.Job;
+            keys.Add((job.DrawingNumber ?? "", job.Title ?? ""));
+        }
+
+        return keys;
+    }
+
+    private static bool IdentitySortKeysEqual(
+        IReadOnlyList<(string DrawingNumber, string Title)> left,
+        IReadOnlyList<(string DrawingNumber, string Title)> right)
+    {
+        if (left.Count != right.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < left.Count; i++)
+        {
+            if (!string.Equals(left[i].DrawingNumber, right[i].DrawingNumber, StringComparison.Ordinal)
+                || !string.Equals(left[i].Title, right[i].Title, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool CanBatchChangePaper(IReadOnlyList<Row> rows)
@@ -2277,6 +2421,7 @@ public sealed partial class RectangleBatchPlotForm : Window
             }
             // 打印期间跳过了 CAD 高亮切换，结束后按当前行同步一次（相同任务时为空操作）。
             _overlay.SetHighlight(_highlightedJob);
+            _appliedHighlightJob = _highlightedJob;
             UpdateVisuals();
         }
     }
@@ -2427,39 +2572,8 @@ public sealed partial class RectangleBatchPlotForm : Window
         UpdateOutputFormatUi();
         _suppressComboEvents = false;
         _styleSelectionReady = true;
-        // 窗体显示后空闲时预热打印管线，把首张开销挪出批打进度窗（PlotMany 内同键调用为空操作）。
-        SchedulePlotWarmUp();
     }
 
-    /** SchedulePlotWarmUp：窗体空闲后分步预热打印管线（引擎/设备介质/CTB/驱动），每步让出 UI。 */
-    private void SchedulePlotWarmUp()
-    {
-        try
-        {
-            // 拆 DWG 不走打印引擎，无需预热。
-            if (IsDwgOutput)
-            {
-                return;
-            }
-
-            var device = SelectedDevice();
-            if (string.IsNullOrWhiteSpace(device))
-            {
-                return;
-            }
-
-            PlotterService.BeginWarmUpPlotPipeline(
-                device,
-                SelectedStyle(),
-                action => Dispatcher.BeginInvoke(
-                    action,
-                    System.Windows.Threading.DispatcherPriority.ApplicationIdle));
-        }
-        catch
-        {
-            // 预热失败不影响打印；PlotMany 内还会同步补做。
-        }
-    }
 
     private static string FindPlotDevice(
         IReadOnlyList<string> devices,
@@ -2495,7 +2609,10 @@ public sealed partial class RectangleBatchPlotForm : Window
     private void UpdateVisuals()
     {
         var selected = _rows.Count(row => row.Selected);
-        var order = _settings.SortOrderHorizontalFirst ? "左→右、上→下" : "上→下、左→右";
+        var spatialOrder = _settings.SortOrderHorizontalFirst ? "左→右、上→下" : "上→下、左→右";
+        var order = _hasAttributeIdentity
+            ? $"按图号（同号同名按{spatialOrder}）"
+            : spatialOrder;
         _status.Text = $"识别 {_rows.Count} 个矩形框  |  已选 {selected} 个  |  格式：{SelectedOutputFormat}  |  顺序：{order}  |  输出：{_outputDirectory.Text}";
         ScheduleOverlayIfRebuildNeeded();
     }
@@ -2880,6 +2997,34 @@ public sealed partial class RectangleBatchPlotForm : Window
             }
         }
     }
+
+    private void GenerateDrawingDirectory()
+    {
+        if (_rows.Count == 0)
+        {
+            MessageBox.Show("当前没有可生成目录的图纸清单。", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var jobs = _rows.Select(row => row.Job).ToList();
+        var ok = false;
+        var message = "";
+        CadWindowFocus.HideForCadInput(this);
+        try
+        {
+            ok = DirectoryTableGenerator.PromptAndGenerate(_document, jobs, _settings, out message);
+        }
+        finally
+        {
+            CadWindowFocus.RestoreDialog(this);
+        }
+
+        MessageBox.Show(message, Title, MessageBoxButton.OK, ok ? MessageBoxImage.Information : MessageBoxImage.Warning);
+    }
+
+    private void GenerateDrawingDirectory_Click(object sender, RoutedEventArgs e) => GenerateDrawingDirectory();
+
+    private void DirectorySettings_Click(object sender, RoutedEventArgs e) => ShowSettingsAtTab(2);
 
     private void ShowSortSettings()
     {

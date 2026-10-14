@@ -154,6 +154,8 @@ public sealed class AppSettings
     public string DirectoryLayerName { get; set; } = "0";
     public bool DirectoryDrawHeader { get; set; } = true;
     public bool DirectoryDrawGridLines { get; set; } = true;
+    /// <summary>生成目录时询问单栏最大高度并启用向右分栏（右栏重复表头）。默认关闭。</summary>
+    public bool DirectoryAskTableBreak { get; set; }
     public List<DirectoryColumnSetting> DirectoryColumns { get; set; } = new();
     /// <summary>
     /// 用户自定义打印比例，语义与内置比例一致：图面尺寸 / 比例 = 纸张毫米尺寸。

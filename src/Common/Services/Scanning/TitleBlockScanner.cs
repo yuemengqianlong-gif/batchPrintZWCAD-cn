@@ -217,15 +217,7 @@ public static class TitleBlockScanner
                 continue;
             }
 
-            CadTextExtractor.OwnerTextCache? ownerTextCache = null;
-            try
-            {
-                ownerTextCache = CadTextExtractor.BuildOwnerTextCache(tr, owner, libraryIndex.NameParts);
-            }
-            catch (Exception ex)
-            {
-                warnings.Add($"布局={spaceName} 文字缓存建立失败，将继续逐个扫描图框: {ex.Message}");
-            }
+            var ownerTextCache = BuildOwnerTextCacheOnce(tr, owner, libraryIndex.NameParts, spaceName, warnings);
 
             foreach (ObjectId id in owner)
             {
@@ -270,6 +262,68 @@ public static class TitleBlockScanner
     /// <summary>
     /// 将单个块参照匹配图框库并生成打印任务；无法匹配时返回 null。
     /// </summary>
+    /// <summary>为真时只需要图框几何（角点），跳过文字缓存与字段文字提取。仅供通用型主导模式定位图框。</summary>
+    [ThreadStatic]
+    private static bool _cornersOnly;
+
+    /// <summary>
+    /// 只识别图框块位置（角点），不提取图名/图号等文字。供通用型“主导图框模式”定位图框用，
+    /// 避免为了几何再跑一遍完整的文字提取。返回的作业文字字段为占位值，不可用于展示。
+    /// </summary>
+    internal static List<PlotJob> ScanFrameCornersOnly(
+        Database db,
+        TitleBlockLibrary library,
+        string sourceName,
+        ISet<string>? allowedLayoutNames)
+    {
+        var previous = _cornersOnly;
+        _cornersOnly = true;
+        try
+        {
+            return Scan(db, library, sourceName, null, TitleBlockScanScope.AllSpaces, null, null, null, allowedLayoutNames);
+        }
+        finally
+        {
+            _cornersOnly = previous;
+        }
+    }
+
+    /// <summary>
+    /// 每个空间只建立一次文字缓存，所有图框复用。按库名过滤建立失败时退回不过滤；
+    /// 仍失败则用空缓存，绝不返回 null（null 会让每个字段区域重新遍历整张图，损坏图纸上会慢数十倍）。
+    /// </summary>
+    private static CadTextExtractor.OwnerTextCache BuildOwnerTextCacheOnce(
+        Transaction tr,
+        BlockTableRecord owner,
+        HashSet<string>? libraryNameParts,
+        string spaceName,
+        List<string> warnings)
+    {
+        if (_cornersOnly)
+        {
+            return CadTextExtractor.EmptyOwnerTextCache();
+        }
+
+        try
+        {
+            return CadTextExtractor.BuildOwnerTextCache(tr, owner, libraryNameParts);
+        }
+        catch (Exception ex)
+        {
+            warnings.Add($"布局={spaceName} 文字缓存建立失败，改用不过滤块名重建: {ex.Message}");
+        }
+
+        try
+        {
+            return CadTextExtractor.BuildOwnerTextCache(tr, owner);
+        }
+        catch (Exception ex)
+        {
+            warnings.Add($"布局={spaceName} 文字缓存重建失败，所有者空间文字将不参与识别: {ex.Message}");
+            return CadTextExtractor.EmptyOwnerTextCache();
+        }
+    }
+
     private static PlotJob? TryCreateJobFromBlockReference(
         Transaction tr,
         BlockReference blockRef,
@@ -489,6 +543,12 @@ public static class TitleBlockScanner
         string phase = "";
         string info1 = "";
         string info2 = "";
+        if (_cornersOnly)
+        {
+            title = "";
+            number = "";
+        }
+        else
         try
         {
             var blockTextCache = CadTextExtractor.BuildBlockReferenceTextCache(tr, blockRef);
@@ -716,15 +776,7 @@ public static class TitleBlockScanner
         {
             var (owner, layout) = owners[pair.Key];
             var spaceName = layout.LayoutName;
-            CadTextExtractor.OwnerTextCache? ownerTextCache = null;
-            try
-            {
-                ownerTextCache = CadTextExtractor.BuildOwnerTextCache(tr, owner, libraryIndex.NameParts);
-            }
-            catch (Exception ex)
-            {
-                warnings.Add($"布局={spaceName} 文字缓存建立失败，将继续逐个扫描图框: {ex.Message}");
-            }
+            var ownerTextCache = BuildOwnerTextCacheOnce(tr, owner, libraryIndex.NameParts, spaceName, warnings);
 
             foreach (var blockRef in pair.Value)
             {

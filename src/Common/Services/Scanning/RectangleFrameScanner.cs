@@ -1095,6 +1095,11 @@ public static class RectangleFrameScanner
             var cache = CadTextExtractor.BuildOwnerTextCacheWithoutBlockNames(tr, owner);
             for (var i = 0; i < results.Count; i++)
             {
+                if (BlockNameRules.ShouldReportProgress(i, 50))
+                {
+                    ReportScan("正在按图框模式识别图名/图号…", i, results.Count);
+                }
+
                 var job = results[i].Job;
                 if (!TryCreateFrameAxes(
                         rectangles[i],
@@ -1122,6 +1127,10 @@ public static class RectangleFrameScanner
             }
 
             tr.Commit();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch
         {
@@ -1429,15 +1438,11 @@ public static class RectangleFrameScanner
         try
         {
             var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { layoutName };
-            var jobs = TitleBlockScanner.Scan(
+            // 只取图框角点，不再跑第二遍图名/图号文字提取（主导模式随后自己按缓存取字）。
+            var jobs = TitleBlockScanner.ScanFrameCornersOnly(
                 database,
                 TitleBlockLibraryStore.Load(),
                 database.Filename ?? "",
-                null,
-                TitleBlockScanScope.AllSpaces,
-                null,
-                null,
-                null,
                 allowed);
             foreach (var job in jobs)
             {
@@ -2003,6 +2008,12 @@ public static class RectangleFrameScanner
         }
 
         var definitionId = blockReference.BlockTableRecord;
+        if (definitionId.IsNull)
+        {
+            // 块定义丢失的损坏 INSERT，无几何可取。
+            return;
+        }
+
         var instanceXform = blockReference.BlockTransform * transform;
 
         // 块定义缓存：同一块定义只遍历一次，后续实例直接变换缓存的局部坐标结果。
@@ -2390,8 +2401,15 @@ public static class RectangleFrameScanner
 	        HashSet<ObjectId> visitedDefinitions,
 	        int depth)
 	    {
+	        var visits = 0;
 	        foreach (ObjectId id in owner)
 	        {
+	            if (depth == 0 && BlockNameRules.ShouldReportProgress(visits, 2500) && visits > 0)
+	            {
+	                ReportScan($"正在检查空框… 已处理 {visits:N0}", visits, 0);
+	            }
+
+	            visits++;
 	            if (tr.GetObject(id, OpenMode.ForRead, false) is not Entity entity)
 	            {
 	                continue;
@@ -2442,7 +2460,7 @@ public static class RectangleFrameScanner
 	            }
 
 	            var definitionId = blockRef.BlockTableRecord;
-	            if (!visitedDefinitions.Add(definitionId))
+	            if (definitionId.IsNull || !visitedDefinitions.Add(definitionId))
 	            {
 	                continue;
 	            }
