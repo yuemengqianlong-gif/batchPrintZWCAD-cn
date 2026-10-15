@@ -15,8 +15,8 @@ public sealed partial class SinglePlotForm : Window
     {
         public double Value { get; set; }
         public override string ToString() => Value > 0
-            ? $"+ {Value:0.#} mm"
-            : $"- {Math.Abs(Value):0.#} mm";
+            ? $"+ {Value:0.#}"
+            : $"- {Math.Abs(Value):0.#}";
     }
 
     // _paperCombo/_outputPath/_areaLabel/_scaleLabel/_styleCombo/_styleSettingsButton/

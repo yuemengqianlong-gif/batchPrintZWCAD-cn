@@ -362,72 +362,47 @@ public sealed partial class BatchPlotForm : Window
 
     private void AddDwgFiles()
     {
-        var dialog = new Microsoft.Win32.OpenFileDialog
-        {
-            Filter = "DWG 文件 (*.dwg)|*.dwg",
-            Multiselect = true,
-            Title = "选择要批量打印的 DWG"
-        };
-
-        if (dialog.ShowDialog() != true)
+        var owner = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        var result = DwgBatchFilePicker.Pick(owner, GetSelectedCadDirectory(), "选择要批量打印的 DWG");
+        if (result == null)
         {
             return;
         }
 
-        var files = dialog.FileNames
-            .Select(Path.GetFullPath)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        BeginMultiFileBatch(files);
-    }
+        if (result.IsFolder)
+        {
+            var folder = result.FolderPath ?? "";
+            List<string> files;
+            try
+            {
+                files = CollectDwgFilesInFolder(folder);
+            }
+            catch (Exception ex)
+            {
+                System.Windows.MessageBox.Show(
+                    "读取文件夹失败: " + ex.Message,
+                    "批量打印",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                return;
+            }
 
-    /// <summary>选择文件夹，收集其中（含子文件夹）全部 DWG，后续流程与多文件批打相同。</summary>
-    private void AddDwgFolder()
-    {
-        using var dialog = new System.Windows.Forms.FolderBrowserDialog
-        {
-            Description = "选择包含 DWG 的文件夹（将包含子文件夹内的文件）",
-            ShowNewFolderButton = false
-        };
-        var seed = GetSelectedCadDirectory();
-        if (!string.IsNullOrWhiteSpace(seed) && Directory.Exists(seed))
-        {
-            dialog.SelectedPath = seed;
-        }
+            if (files.Count == 0)
+            {
+                System.Windows.MessageBox.Show(
+                    "该文件夹内未找到 DWG 文件。",
+                    "批量打印",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
 
-        if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK
-            || string.IsNullOrWhiteSpace(dialog.SelectedPath))
-        {
+            AppendLog("INFO", $"文件夹批打：{folder}，共 {files.Count} 个 DWG。");
+            BeginMultiFileBatch(files);
             return;
         }
 
-        List<string> files;
-        try
-        {
-            files = CollectDwgFilesInFolder(dialog.SelectedPath);
-        }
-        catch (Exception ex)
-        {
-            System.Windows.MessageBox.Show(
-                "读取文件夹失败: " + ex.Message,
-                "批量打印",
-                MessageBoxButton.OK,
-                MessageBoxImage.Warning);
-            return;
-        }
-
-        if (files.Count == 0)
-        {
-            System.Windows.MessageBox.Show(
-                "该文件夹内未找到 DWG 文件。",
-                "批量打印",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
-            return;
-        }
-
-        AppendLog("INFO", $"文件夹批打：{dialog.SelectedPath}，共 {files.Count} 个 DWG。");
-        BeginMultiFileBatch(files);
+        BeginMultiFileBatch(result.Files);
     }
 
     /// <summary>枚举文件夹及其子文件夹中的全部 .dwg（忽略大小写去重，按路径排序）。</summary>
@@ -1792,6 +1767,7 @@ public sealed partial class BatchPlotForm : Window
             if (!form.RequestPickDirectoryRowHeight
                 && !form.RequestPickDirectoryTextAppearance
                 && !form.RequestPickScaleFromCad
+                && !form.RequestPickFrameBlockName
                 && string.IsNullOrWhiteSpace(form.RequestedDirectoryColumnKey))
             {
                 tabIndex = form.SelectedTabIndex;
@@ -2737,7 +2713,6 @@ public sealed partial class BatchPlotForm : Window
     private void ScanSelectedObjects_Click(object sender, RoutedEventArgs e) => ScanSelectedObjects();
 
     private void AddDwgFiles_Click(object sender, RoutedEventArgs e) => AddDwgFiles();
-    private void AddDwgFolder_Click(object sender, RoutedEventArgs e) => AddDwgFolder();
 
     private void ClearJobs_Click(object sender, RoutedEventArgs e) => ClearJobs();
 
@@ -2827,8 +2802,8 @@ public sealed partial class BatchPlotForm : Window
     {
         public double Value { get; set; }
         public override string ToString() => Value > 0
-            ? $"+ {Value:0.#} mm"
-            : $"- {Math.Abs(Value):0.#} mm";
+            ? $"+ {Value:0.#}"
+            : $"- {Math.Abs(Value):0.#}";
     }
 
     /// <summary>初始化留白下拉列表，正值=扩大纸张，负值=缩比例，整数1~10配对显示。</summary>

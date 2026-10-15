@@ -162,6 +162,40 @@ public sealed class AppSettings
     /// &gt;1 表示 1:N（如 143 表示 1:143）；&lt;1 表示放大比例（如 0.25 表示 4:1）。
     /// </summary>
     public List<double> CustomScales { get; set; } = new();
+    /// <summary>
+    /// 用户在「比例设置」中删除的内置比例。内置比例本身只读，
+    /// 删除动作记录在此列表中，识别时从内置比例集合里剔除对应项。
+    /// </summary>
+    public List<double> RemovedBuiltInScales { get; set; } = new();
+
+    /// <summary>
+    /// 「属性框配置 → 图框块名限定设置」：限定可作为图框识别的图块块名。
+    /// 多个块名用英文逗号分隔，支持 CAD 通配符（* ? #）；空字符串表示不限定，
+    /// 按原有逻辑识别所有图块与散线图元。
+    /// </summary>
+    public string FrameBlockNameFilter { get; set; } = "";
+
+    /// <summary>
+    /// 「属性框配置 → 图框块名限定设置 → 仅识别块图框」：勾选后，通用型批量打印
+    /// 只把命中图框块名限定、通过图签 TAG 验证且尺寸符合 GB/T 14689 标准图幅
+    /// （A0~A4 基础幅面及其规定的加长图幅）的图块识别为打印区域；其余图块、
+    /// 矩形、首尾相连四线构成的类矩形图元一律不参与打印区域识别。
+    /// 不勾选时按原有规则扫描图块与矩形。
+    /// </summary>
+    public bool FrameBlockOnlyMode { get; set; }
+
+    /// <summary>「属性框配置」图签属性标记（TAG）映射：图号。留空表示不参与识别。</summary>
+    public string TitleBlockTagDrawingNumber { get; set; } = "图号";
+    /// <summary>图签属性标记映射：版次。留空表示不参与识别。</summary>
+    public string TitleBlockTagRevision { get; set; } = "";
+    /// <summary>图签属性标记映射：图名。留空表示不参与识别。</summary>
+    public string TitleBlockTagTitle { get; set; } = "图名";
+    /// <summary>图签属性标记映射：日期。留空表示不参与识别。</summary>
+    public string TitleBlockTagDate { get; set; } = "";
+    /// <summary>图签属性标记映射：信息1。留空表示不参与识别。</summary>
+    public string TitleBlockTagInfo1 { get; set; } = "";
+    /// <summary>图签属性标记映射：信息2。留空表示不参与识别。</summary>
+    public string TitleBlockTagInfo2 { get; set; } = "";
 }
 
 public static class AppSettingsStore
@@ -392,7 +426,15 @@ public static class AppSettingsStore
             settings.FileNameSequenceStartNumber = 1;
         }
 
-        settings.CustomScales = NormalizeCustomScales(settings.CustomScales);
+        settings.RemovedBuiltInScales = NormalizeRemovedBuiltInScales(settings.RemovedBuiltInScales);
+        settings.CustomScales = NormalizeCustomScales(settings.CustomScales, settings.RemovedBuiltInScales);
+        settings.FrameBlockNameFilter = (settings.FrameBlockNameFilter ?? "").Trim();
+        settings.TitleBlockTagDrawingNumber = (settings.TitleBlockTagDrawingNumber ?? "").Trim();
+        settings.TitleBlockTagRevision = (settings.TitleBlockTagRevision ?? "").Trim();
+        settings.TitleBlockTagTitle = (settings.TitleBlockTagTitle ?? "").Trim();
+        settings.TitleBlockTagDate = (settings.TitleBlockTagDate ?? "").Trim();
+        settings.TitleBlockTagInfo1 = (settings.TitleBlockTagInfo1 ?? "").Trim();
+        settings.TitleBlockTagInfo2 = (settings.TitleBlockTagInfo2 ?? "").Trim();
         settings.RasterExportDpi = RasterExportSettings.NormalizeDpi(settings.RasterExportDpi);
         settings.RasterExportJpegQuality = RasterExportSettings.NormalizeJpegQuality(settings.RasterExportJpegQuality);
 
@@ -402,7 +444,7 @@ public static class AppSettingsStore
     /// <summary>
     /// 自定义比例兜底校验：剔除非法值、按 1e-6 容差去重、剔除与内置比例重复的项并升序排列。
     /// </summary>
-    private static List<double> NormalizeCustomScales(List<double>? scales)
+    private static List<double> NormalizeRemovedBuiltInScales(List<double>? scales)
     {
         var normalized = new List<double>();
         if (scales != null)
@@ -411,7 +453,7 @@ public static class AppSettingsStore
             {
                 if (scale <= 0
                     || normalized.Any(x => Math.Abs(x - scale) < 1e-6)
-                    || PaperSizeDetector.BuiltInScales.Any(x => Math.Abs(x - scale) < 1e-6))
+                    || !PaperSizeDetector.BuiltInScales.Any(x => Math.Abs(x - scale) < 1e-6))
                 {
                     continue;
                 }
@@ -423,6 +465,34 @@ public static class AppSettingsStore
         normalized.Sort();
         return normalized;
     }
+
+private static List<double> NormalizeCustomScales(List<double>? scales, List<double>? removedBuiltInScales = null)
+    {
+        var removed = removedBuiltInScales ?? new List<double>();
+        bool IsRemovedBuiltIn(double scale) => removed.Any(x => Math.Abs(x - scale) < 1e-6);
+        var normalized = new List<double>();
+        if (scales != null)
+        {
+            foreach (var scale in scales)
+            {
+                if (scale <= 0
+                    || normalized.Any(x => Math.Abs(x - scale) < 1e-6)
+                    || (PaperSizeDetector.BuiltInScales.Any(x => Math.Abs(x - scale) < 1e-6) && !IsRemovedBuiltIn(scale)))
+                {
+                    continue;
+                }
+
+                normalized.Add(scale);
+            }
+        }
+
+        normalized.Sort();
+        return normalized;
+    }
+
+    /// <summary>
+    /// 已删除内置比例校验：只保留确实是内置比例的值，按 1e-6 容差去重并升序排列。
+    /// </summary>
 
     private static List<DirectoryColumnSetting> NormalizeDirectoryColumns(AppSettings settings)
     {

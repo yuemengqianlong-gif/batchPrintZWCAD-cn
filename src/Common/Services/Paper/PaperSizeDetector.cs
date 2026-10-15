@@ -55,6 +55,9 @@ public static class PaperSizeDetector
         /// 在内置比例之外追加参与匹配的自定义比例（设置中的“比例设置”列表）；null 或空表示只用内置比例。
         /// </summary>
         public IReadOnlyList<double>? ExtraScales { get; set; }
+        public IReadOnlyList<double>? ExcludedScales { get; set; }
+        public bool LimitLongSideToStandardExtension { get; set; }
+        public bool RequireStandardLongSide { get; set; }
     }
 
     public static readonly DetectionOptions DefaultDetectionOptions = new();
@@ -449,7 +452,7 @@ public static class PaperSizeDetector
     /// 与最近 1/8 模数的差距在吸附容差内按标准加长图输出，超出才保留实测尺寸生成动态纸张。
     /// 布局空间优先 1:1，模型空间沿用常用的 1:100 优先。
     /// </summary>
-    public static DetectionOptions CreateTitleBlockBatchOptions(double paperMatchToleranceMm, bool isPaperSpace, double? longPaperSnapToleranceMm = null, IReadOnlyList<double>? customScales = null)
+    public static DetectionOptions CreateTitleBlockBatchOptions(double paperMatchToleranceMm, bool isPaperSpace, double? longPaperSnapToleranceMm = null, IReadOnlyList<double>? customScales = null, IReadOnlyList<double>? removedBuiltInScales = null)
     {
         return new DetectionOptions
         {
@@ -458,7 +461,8 @@ public static class PaperSizeDetector
             LongPaperShortSideToleranceMm = Math.Max(0d, paperMatchToleranceMm),
             LongPaperSnapToleranceMm = longPaperSnapToleranceMm,
             PreferredScaleValue = isPaperSpace ? 1d : 100d,
-            ExtraScales = customScales
+            ExtraScales = customScales,
+            ExcludedScales = removedBuiltInScales
         };
     }
 
@@ -583,7 +587,7 @@ public static class PaperSizeDetector
     /// 创建矩形框批打专用识别参数。短边匹配用纸张匹配容差，长边 1/8 模数吸附用专用吸附容差；
     /// 模型空间优先按 1:100 解释，布局空间优先按 1:1 解释，同时把另一常用比例排在其余比例之前。
     /// </summary>
-    public static DetectionOptions CreateRectangleBatchOptions(double paperMatchToleranceMm, bool isPaperSpace, double? longPaperSnapToleranceMm = null, IReadOnlyList<double>? customScales = null)
+    public static DetectionOptions CreateRectangleBatchOptions(double paperMatchToleranceMm, bool isPaperSpace, double? longPaperSnapToleranceMm = null, IReadOnlyList<double>? customScales = null, IReadOnlyList<double>? removedBuiltInScales = null, bool strictStandardOnly = false, bool limitLongSideToExtension = true)
     {
         var toleranceMm = Math.Max(0d, paperMatchToleranceMm);
         return new DetectionOptions
@@ -594,7 +598,10 @@ public static class PaperSizeDetector
             PreferredScaleValues = isPaperSpace
                 ? new[] { 1d, 100d }
                 : new[] { 100d, 1d },
-            ExtraScales = customScales
+            ExtraScales = customScales,
+            ExcludedScales = removedBuiltInScales,
+            LimitLongSideToStandardExtension = limitLongSideToExtension,
+            RequireStandardLongSide = strictStandardOnly
         };
     }
 
@@ -612,6 +619,11 @@ public static class PaperSizeDetector
         if (candidates.Count > 0)
         {
             return candidates;
+        }
+
+        if (options.RequireStandardLongSide)
+        {
+            return new PaperDetection[0];
         }
 
         return DetectRectangleBatchAspectRatioCandidates(width, height);
@@ -795,7 +807,7 @@ public static class PaperSizeDetector
         var actualWidth = Math.Abs(width);
         var actualHeight = Math.Abs(height);
         var candidates = new List<PaperCandidate>();
-        var scales = MergeScales(options.ExtraScales);
+        var scales = MergeScales(options.ExtraScales, options.ExcludedScales);
         foreach (var paper in Standards)
         {
             foreach (var scale in scales)
@@ -1042,6 +1054,12 @@ public static class PaperSizeDetector
             return;
         }
 
+        if (options.LimitLongSideToStandardExtension
+            && actualLong > MaxStandardExtendedLongMm(paper) + toleranceMm)
+        {
+            return;
+        }
+
         var longErrorFromStandardMm = Math.Abs(actualLong - paper.LongSide);
         var landscape = widthMm >= heightMm;
         if (longErrorFromStandardMm <= toleranceMm)
@@ -1084,6 +1102,11 @@ public static class PaperSizeDetector
                 PaperHeightMm = landscape ? paper.ShortSide : snappedLong,
                 Reason = $"短边误差 {shortErrorMm:0.###}mm，长边命中 1/8 模数 {snappedLong:0.###}mm，模数误差 {modularErrorMm:0.###}mm（吸附容差 {snapToleranceMm:0.###}mm）"
             });
+            return;
+        }
+
+        if (options.RequireStandardLongSide)
+        {
             return;
         }
 
@@ -1260,9 +1283,28 @@ public static class PaperSizeDetector
     /// <summary>
     /// 合并内置比例和用户自定义比例；剔除非法值并按 1e-6 容差去重，避免重复候选干扰排序。
     /// </summary>
-    private static List<double> MergeScales(IReadOnlyList<double>? extraScales)
+        private static double MaxStandardExtendedLongMm(StandardPaper paper)
     {
-        var scales = new List<double>(CommonScales);
+        return paper.Name switch
+        {
+            "A0" => 2230d,
+            "A1" => 2102d,
+            "A2" => 1487d,
+            "A3" => 1682d,
+            "A4" => 1471d,
+            _ => double.MaxValue
+        };
+    }
+
+    private static List<double> MergeScales(IReadOnlyList<double>? extraScales, IReadOnlyList<double>? excludedScales = null)
+    {
+        IEnumerable<double> builtin = CommonScales;
+        if (excludedScales != null && excludedScales.Count > 0)
+        {
+            builtin = CommonScales.Where(scale => !excludedScales.Any(x => Math.Abs(x - scale) < 1e-6));
+        }
+
+        var scales = new List<double>(builtin);
         if (extraScales == null)
         {
             return scales;

@@ -373,6 +373,12 @@ public sealed partial class SettingsForm : Window
     public bool RequestPickDirectoryTextAppearance { get; private set; }
     public bool RequestPickScaleFromCad { get; private set; }
 
+    /// <summary>请求回到 CAD 点选图框块并把块名写入属性框配置。</summary>
+    public bool RequestPickFrameBlockName { get; private set; }
+
+    /// <summary>本次窗口中删除的内置比例（保存时写入 RemovedBuiltInScales）。</summary>
+    private HashSet<double> _removedBuiltInScales = new();
+
     /// <summary>
     /// 设置/获取下次打开设置窗口时默认显示的标签页索引（0=常规, 1=文件名, 2=图纸目录, 3=比例设置）。
     /// 调用方在窗体关闭后读取 <see cref="SelectedTabIndex"/> 并传入下一次构造，实现图中交互后回到原标签页。
@@ -1008,6 +1014,35 @@ public sealed partial class SettingsForm : Window
         RequestScaleFromCad();
     }
 
+    
+    private void OnPickFrameBlockNameClick(object sender, RoutedEventArgs e)
+    {
+        RequestFrameBlockNameFromCad();
+    }
+
+    private void RequestFrameBlockNameFromCad()
+    {
+        if (GetActiveDocument() == null)
+        {
+            System.Windows.MessageBox.Show("当前没有可用的 CAD 文档。", "批量打印设置", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (!TryReadSettingsFromControls(out var settings))
+        {
+            return;
+        }
+
+        if (!TrySaveSettingsOrReport(settings))
+        {
+            return;
+        }
+
+        RequestPickFrameBlockName = true;
+        DialogResult = true;
+        Close();
+    }
+
     private void OnRemoveScaleClick(object sender, RoutedEventArgs e)
     {
         RemoveSelectedCustomScales();
@@ -1015,14 +1050,21 @@ public sealed partial class SettingsForm : Window
 
     private void ReloadScaleList(AppSettings settings)
     {
+        _removedBuiltInScales = new HashSet<double>(settings.RemovedBuiltInScales ?? new List<double>());
         _scaleList.Items.Clear();
         foreach (var scale in PaperSizeDetector.BuiltInScales)
         {
+            if (_removedBuiltInScales.Contains(scale))
+            {
+                continue;
+            }
+
             _scaleList.Items.Add(new ScaleListItem(scale, false));
         }
 
         foreach (var scale in settings.CustomScales)
         {
+            _removedBuiltInScales.Remove(scale);
             _scaleList.Items.Add(new ScaleListItem(scale, true));
         }
 
@@ -1038,18 +1080,18 @@ public sealed partial class SettingsForm : Window
         var customCount = items.Count - builtInCount;
         _scaleListSummary.Text = $"内置 {builtInCount} 个 · 自定义 {customCount} 个（Ctrl/Shift 可多选）";
 
-        var canDelete = selected.Count > 0 && selected.All(item => item.IsCustom);
+        var canDelete = selected.Count > 0;
         _removeScaleButton.IsEnabled = canDelete;
 
         _scaleSelectionHint.Text = selected.Count switch
         {
-            0 => "请选择自定义比例后删除；内置比例始终保留。",
-            _ when canDelete => $"已选择 {selected.Count} 个自定义比例，可以删除。",
-            _ => "当前选择包含内置比例，内置比例不可删除。"
+            0 => "请选中要删除的比例；内置比例删除后可重新添加。",
+            1 => canDelete && selected[0].IsCustom
+                ? "已选择 1 个自定义比例，可以删除。"
+                : "已选择 1 个内置比例，删除后不再参与识别。",
+            _ => $"已选择 {selected.Count} 个比例，可以删除。"
         };
-        _scaleSelectionHint.Foreground = selected.Count > 0 && !canDelete
-            ? new SolidColorBrush(Color.FromRgb(174, 100, 25))
-            : Brushes.DimGray;
+        _scaleSelectionHint.Foreground = Brushes.DimGray;
     }
 
     private List<double> ReadCustomScalesFromList()
@@ -1110,19 +1152,13 @@ public sealed partial class SettingsForm : Window
             return;
         }
 
-        if (selected.Any(x => !x.IsCustom))
-        {
-            System.Windows.MessageBox.Show(
-                "内置比例不可删除，只能移除“（自定义）”比例。",
-                Title,
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
-            return;
-        }
-
         foreach (var item in selected)
         {
             _scaleList.Items.Remove(item);
+            if (!item.IsCustom)
+            {
+                _removedBuiltInScales.Add(item.Value);
+            }
         }
 
         UpdateScaleListState();
@@ -1198,6 +1234,14 @@ public sealed partial class SettingsForm : Window
         LoadDirectoryColumns(settings.DirectoryColumns);
         _longPaperNameFormat.SelectedIndex = Math.Max(0, Math.Min(5, (int)settings.LongPaperNameFormat));
         _longPaperSnapTolerance.Value = settings.LongPaperSnapToleranceMm;
+                _frameBlockNameFilter.Text = settings.FrameBlockNameFilter;
+        _frameBlockOnlyMode.IsChecked = settings.FrameBlockOnlyMode;
+        _tagDrawingNumber.Text = string.IsNullOrWhiteSpace(settings.TitleBlockTagDrawingNumber) ? "图号" : settings.TitleBlockTagDrawingNumber;
+        _tagRevision.Text = settings.TitleBlockTagRevision ?? "";
+        _tagTitle.Text = string.IsNullOrWhiteSpace(settings.TitleBlockTagTitle) ? "图名" : settings.TitleBlockTagTitle;
+        _tagDate.Text = settings.TitleBlockTagDate ?? "";
+        _tagInfo1.Text = settings.TitleBlockTagInfo1 ?? "";
+        _tagInfo2.Text = settings.TitleBlockTagInfo2 ?? "";
         ReloadScaleList(settings);
     }
 
@@ -1288,6 +1332,15 @@ public sealed partial class SettingsForm : Window
         current.DirectoryColumns = directoryColumns;
         current.LongPaperNameFormat = (LongPaperNameFormat)Math.Max(0, Math.Min(5, _longPaperNameFormat.SelectedIndex));
         current.LongPaperSnapToleranceMm = _longPaperSnapTolerance.Value;
+        current.FrameBlockNameFilter = _frameBlockNameFilter.Text.Trim();
+        current.FrameBlockOnlyMode = _frameBlockOnlyMode.IsChecked == true;
+        current.TitleBlockTagDrawingNumber = _tagDrawingNumber.Text.Trim();
+        current.TitleBlockTagRevision = _tagRevision.Text.Trim();
+        current.TitleBlockTagTitle = _tagTitle.Text.Trim();
+        current.TitleBlockTagDate = _tagDate.Text.Trim();
+        current.TitleBlockTagInfo1 = _tagInfo1.Text.Trim();
+        current.TitleBlockTagInfo2 = _tagInfo2.Text.Trim();
+        current.RemovedBuiltInScales = _removedBuiltInScales.ToList();
         current.CustomScales = ReadCustomScalesFromList();
         return true;
     }

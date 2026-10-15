@@ -228,7 +228,7 @@ public sealed partial class BatchPlotCommands
                 settings.PaperMatchToleranceMm,
                 isPaperSpace,
                 settings.LongPaperSnapToleranceMm,
-                settings.CustomScales);
+                settings.CustomScales, settings.RemovedBuiltInScales);
             // 只有可自由拉长的块才按 A1+ 入库；仅在 A1/A2/A3 间切换的可见性块仍保存固定纸张。
             paperDetectionOptions.IncludeGenericDynamicTitleBlockPaper = isStretchableBlock;
             // 识别不到标准纸张时要求用户输入绘图比例，按 图面尺寸/比例 生成任意纸张，避免超大尺寸输出。
@@ -261,7 +261,7 @@ public sealed partial class BatchPlotCommands
                        paperOptions,
                        paperDetectionOptions))
             {
-                if (ShowModelessDialogAndWait(fieldDialog) != System.Windows.Forms.DialogResult.OK)
+                if (ShowModalDialog(fieldDialog) != System.Windows.Forms.DialogResult.OK)
                 {
                     AddBlockLog("Field selection cancelled.");
                     return false;

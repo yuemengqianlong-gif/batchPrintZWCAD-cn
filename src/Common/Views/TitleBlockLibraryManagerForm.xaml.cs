@@ -12,6 +12,8 @@ using System.Windows.Input;
 using System.Windows.Media;
 #if AUTOCAD
 using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.EditorInput;
+using System.Windows.Interop;
 #if ACAD_CORE
 using CadApp = Autodesk.AutoCAD.ApplicationServices.Core.Application;
 #else
@@ -264,11 +266,38 @@ public sealed partial class TitleBlockLibraryManagerForm : Window
         CadWindowFocus.HideForCadInput(this);
         try
         {
+#if AUTOCAD
+            // AutoCAD: StartUserInteraction 与模态字段窗配合，避免图框录入重入。
+            var doc = CadApp.DocumentManager.MdiActiveDocument;
+            EditorUserInteraction? ui = null;
+            try
+            {
+                if (doc != null)
+                {
+                    var hwnd = new WindowInteropHelper(this).Handle;
+                    if (hwnd != IntPtr.Zero)
+                    {
+                        ui = doc.Editor.StartUserInteraction(hwnd);
+                    }
+                }
+
+                if (BatchPlotCommands.AddTitleBlockFromLibrary())
+                {
+                    LibraryChanged = true;
+                    LoadRows();
+                }
+            }
+            finally
+            {
+                ui?.End();
+            }
+#else
             if (BatchPlotCommands.AddTitleBlockFromLibrary())
             {
                 LibraryChanged = true;
                 LoadRows();
             }
+#endif
         }
         finally
         {

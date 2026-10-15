@@ -22,6 +22,7 @@ public static class CadMenuInstaller
     /// 链式动态加载或重复 NETLOAD 时直接 Add 同名菜单会触发 COM 异常。
     /// </summary>
     private const string MenuName = "LA批量打印";
+    private static readonly string[] LegacyMenuNames = { "Lxl打印", "Lxl批量打印" };
 #if ZWCAD
     private const string PreferredMenuGroupName = "ZWCAD";
 #else
@@ -36,7 +37,12 @@ public static class CadMenuInstaller
     {
         try
         {
-            ShowMenuBar();
+            CadRibbonInstaller.Install();
+            if (!IsMenuBarVisible())
+            {
+                return;
+            }
+            // keep classic menu only when MENUBAR visible; never force MENUBAR=1
 
 #if ACAD_CORE
             // ACAD Core 控制台模式：通过反射获取 COM 对象
@@ -74,6 +80,11 @@ public static class CadMenuInstaller
                 WriteMessage("\n批量打印插件已加载，但未取得菜单集合。");
 #endif
                 return;
+            }
+
+            foreach (var legacyName in LegacyMenuNames)
+            {
+                RemoveLegacyMenuByName(menus, legacyName);
             }
 
             var menu = GetOrCreateMenu(menus);
@@ -141,6 +152,35 @@ public static class CadMenuInstaller
     /// 获取已存在的批打印菜单；不存在时创建后再返回。
     /// 只有确认不存在同名菜单时才调用 Add，避免“菜单组中存在弹出菜单”异常。
     /// </summary>
+
+    private static bool IsMenuBarVisible()
+    {
+        try
+        {
+            var value = CadApp.GetSystemVariable("MENUBAR");
+            return Convert.ToInt32(value) != 0;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+
+    private static void RemoveLegacyMenuByName(object menus, string legacyName)
+    {
+        try
+        {
+            var menu = menus.GetType().InvokeMember(
+                "Item", System.Reflection.BindingFlags.InvokeMethod, null, menus, new object[] { legacyName });
+            if (menu == null) return;
+            TryInvoke(menu, "RemoveFromMenuBar");
+        }
+        catch
+        {
+        }
+    }
+
     private static object? GetOrCreateMenu(object menus)
     {
         var menu = TryGetMenu(menus);
@@ -201,7 +241,7 @@ public static class CadMenuInstaller
     {
         try
         {
-            CadApp.SetSystemVariable("MENUBAR", 1);
+            // CadApp.SetSystemVariable("MENUBAR", 1); // never force
         }
         catch
         {

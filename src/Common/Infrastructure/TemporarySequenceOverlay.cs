@@ -94,87 +94,145 @@ public sealed class TemporarySequenceOverlay : IDisposable
         for (var i = 0; i < jobs.Count; i++)
         {
             var job = jobs[i];
-            if (!TryGetBounds(job, dcsToWcs, out var minX, out var minY, out var maxX, out var maxY))
+            // 单个任务的坐标异常或 CAD 引擎报错只跳过该框，不让整批红框重建失败，
+            // 更不能把中途失败的图元留在未提交事务里直接丢弃（个别 CAD 内核会因此崩溃）。
+            try
             {
-                continue;
+                DrawJobOverlay(tr, db, job, i, jobs, dcsToWcs, ucsAngle, highlightJob, labelProvider, layerId, textStyleId);
             }
-
-            var width = maxX - minX;
-            var height = maxY - minY;
-            var minSide = Math.Min(width, height);
-            var padding = Math.Max(minSide * 0.035, 10d);
-            // 默认临时标注显示打印顺序；图号重排预览时可临时显示预计写入的新图号。
-            // 先确定文字再算字高，长图号需要按框宽收小。
-            var labelText = labelProvider?.Invoke(job, i) ?? (i + 1).ToString();
-            var textHeight = GetTextHeight(width, height, labelText);
-            // 高亮行：黄色 (ACI 2)、略粗边框（普通宽度 × 1.3）；普通行：红色 (ACI 1)
-            var isHighlight = ReferenceEquals(job, highlightJob);
-            var color = GetOverlayColor(isHighlight);
-            // 保存普通/高亮两套宽度，后续 DataGrid 换行只改实体属性，不再整批删除重画。
-            var normalFrameWidth = GetFrameWidth(minSide);
-            var highlightFrameWidth = normalFrameWidth * HighlightFrameWidthScale;
-            var frameWidth = isHighlight ? highlightFrameWidth : normalFrameWidth;
-            var lineWeight = GetLineWeight(minSide);
-
-            var ownerId = GetJobOwnerId(tr, db, job);
-            if (ownerId.IsNull)
+            catch
             {
-                continue;
+                // 跳过该任务，其余红框照常绘制。
             }
-
-            var owner = (BlockTableRecord)tr.GetObject(ownerId, OpenMode.ForWrite);
-
-            // UCS 任务使用扫描时保存的基轴和局部边界；不能拿当前会话 UCS 或 WCS 包围盒代替。
-            var jobAngle = ucsAngle;
-            var cx = (minX + maxX) / 2d;
-            var cy = (minY + maxY) / 2d;
-            if (job.UsesUserCoordinateSystem)
-            {
-                var localCenter = new Point3d(cx, cy, 0)
-                    .TransformBy(CadSelectionWindow.GetJobUcsToWorld(job));
-                cx = localCenter.X;
-                cy = localCenter.Y;
-                jobAngle = Math.Atan2(job.UcsXAxisY, job.UcsXAxisX);
-            }
-
-            // 红框按任务自己的坐标轴旋转后绘制到 WCS，方向与实际打印窗口一致；
-            // 四周另外外扩 padding，避免粗框压住图框线，因此红框比打印窗口略大一圈。
-            var cosA = Math.Cos(jobAngle);
-            var sinA = Math.Sin(jobAngle);
-            var hw = (maxX - minX) / 2d + padding;
-            var hh = (maxY - minY) / 2d + padding;
-
-            Point2d Rot(double dx, double dy) =>
-                new(cx + dx * cosA - dy * sinA, cy + dx * sinA + dy * cosA);
-
-            var frame = new Polyline(4)
-            {
-                Closed = true,
-                Color = color,
-                LayerId = layerId,
-                LineWeight = lineWeight,
-                ConstantWidth = frameWidth
-            };
-            frame.AddVertexAt(0, Rot(-hw, -hh), 0, 0, 0);
-            frame.AddVertexAt(1, Rot(+hw, -hh), 0, 0, 0);
-            frame.AddVertexAt(2, Rot(+hw, +hh), 0, 0, 0);
-            frame.AddVertexAt(3, Rot(-hw, +hh), 0, 0, 0);
-
-            var group = new OverlayEntityGroup
-            {
-                NormalFrameWidth = normalFrameWidth,
-                HighlightFrameWidth = highlightFrameWidth
-            };
-            group.FrameId = AddEntity(tr, owner, frame);
-
-            var center = new Point3d(cx, cy, 0);
-            AddLabel(tr, owner, layerId, textStyleId, color, center, labelText, textHeight, jobAngle, group.LabelIds);
-            _entityGroups[job] = group;
         }
 
         _highlightedJob = highlightJob;
         tr.Commit();
         UpdateScreenOnly();
+    }
+
+
+    private void DrawJobOverlay(
+        Transaction tr,
+        Database db,
+        PlotJob job,
+        int index,
+        IReadOnlyList<PlotJob> jobs,
+        Matrix3d dcsToWcs,
+        double ucsAngle,
+        PlotJob? highlightJob,
+        Func<PlotJob, int, string>? labelProvider,
+        ObjectId layerId,
+        ObjectId textStyleId)
+    {
+        if (!TryGetBounds(job, dcsToWcs, out var minX, out var minY, out var maxX, out var maxY))
+        {
+            return;
+        }
+
+        var width = maxX - minX;
+        var height = maxY - minY;
+        // 非标准图元误判出的图框可能出现 0/负/超大尺寸；不设防时 CAD 引擎画红框会直接崩溃。
+        if (!IsSaneLength(width) || !IsSaneLength(height))
+        {
+            return;
+        }
+        var minSide = Math.Min(width, height);
+        var padding = Math.Max(minSide * 0.035, 10d);
+        if (!IsSaneLength(padding))
+        {
+            padding = 10d;
+        }
+        // 默认临时标注显示打印顺序；图号重排预览时可临时显示预计写入的新图号。
+        // 先确定文字再算字高，长图号需要按框宽收小。
+        var labelText = labelProvider?.Invoke(job, index) ?? (index + 1).ToString();
+        var textHeight = GetTextHeight(width, height, labelText);
+        if (!IsSaneLength(textHeight) || textHeight <= 1e-6)
+        {
+            textHeight = Math.Max(1e-3, minSide * 0.1);
+        }
+        // 高亮行：黄色 (ACI 2)、略粗边框（普通宽度 × 1.3）；普通行：红色 (ACI 1)
+        var isHighlight = ReferenceEquals(job, highlightJob);
+        var color = GetOverlayColor(isHighlight);
+        // 保存普通/高亮两套宽度，后续 DataGrid 换行只改实体属性，不再整批删除重画。
+        var normalFrameWidth = GetFrameWidth(minSide);
+        var highlightFrameWidth = normalFrameWidth * HighlightFrameWidthScale;
+        var frameWidth = isHighlight ? highlightFrameWidth : normalFrameWidth;
+        var lineWeight = GetLineWeight(minSide);
+
+        var ownerId = GetJobOwnerId(tr, db, job);
+        if (ownerId.IsNull)
+        {
+            return;
+        }
+
+        var owner = (BlockTableRecord)tr.GetObject(ownerId, OpenMode.ForWrite);
+
+        // UCS 任务使用扫描时保存的基轴和局部边界；不能拿当前会话 UCS 或 WCS 包围盒代替。
+        var jobAngle = ucsAngle;
+        var cx = (minX + maxX) / 2d;
+        var cy = (minY + maxY) / 2d;
+        if (job.UsesUserCoordinateSystem)
+        {
+            var localCenter = new Point3d(cx, cy, 0)
+                .TransformBy(CadSelectionWindow.GetJobUcsToWorld(job));
+            cx = localCenter.X;
+            cy = localCenter.Y;
+            jobAngle = Math.Atan2(job.UcsXAxisY, job.UcsXAxisX);
+        }
+
+        // 红框按任务自己的坐标轴旋转后绘制到 WCS，方向与实际打印窗口一致；
+        // 四周另外外扩 padding，避免粗框压住图框线，因此红框比打印窗口略大一圈。
+        var cosA = Math.Cos(jobAngle);
+        var sinA = Math.Sin(jobAngle);
+        if (!IsFinite(cx) || !IsFinite(cy) || !IsFinite(cosA) || !IsFinite(sinA))
+        {
+            return;
+        }
+        var hw = (maxX - minX) / 2d + padding;
+        var hh = (maxY - minY) / 2d + padding;
+        if (!IsSaneLength(frameWidth) || !IsSaneLength(hw) || !IsSaneLength(hh))
+        {
+            return;
+        }
+
+        Point2d Rot(double dx, double dy) =>
+            new(cx + dx * cosA - dy * sinA, cy + dx * sinA + dy * cosA);
+
+        var frame = new Polyline(4)
+        {
+            Closed = true,
+            Color = color,
+            LayerId = layerId,
+            LineWeight = lineWeight,
+            ConstantWidth = frameWidth
+        };
+        frame.AddVertexAt(0, Rot(-hw, -hh), 0, 0, 0);
+        frame.AddVertexAt(1, Rot(+hw, -hh), 0, 0, 0);
+        frame.AddVertexAt(2, Rot(+hw, +hh), 0, 0, 0);
+        frame.AddVertexAt(3, Rot(-hw, +hh), 0, 0, 0);
+
+        var group = new OverlayEntityGroup
+        {
+            NormalFrameWidth = normalFrameWidth,
+            HighlightFrameWidth = highlightFrameWidth
+        };
+        group.FrameId = AddEntity(tr, owner, frame);
+
+        var center = new Point3d(cx, cy, 0);
+        AddLabel(tr, owner, layerId, textStyleId, color, center, labelText, textHeight, jobAngle, group.LabelIds);
+        _entityGroups[job] = group;
+        
+    }
+
+    private static bool IsSaneLength(double value)
+    {
+        return IsFinite(value) && value > 1e-9 && value < 1e9;
+    }
+
+    private static bool IsFinite(double value)
+    {
+        return !(double.IsNaN(value) || double.IsInfinity(value));
     }
 
     public void Clear(bool repaint = true)

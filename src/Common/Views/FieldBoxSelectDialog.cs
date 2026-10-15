@@ -39,6 +39,9 @@ public sealed class FieldBoxSelectDialog : Form
     private readonly Matrix3d _inverseBlockTransform;
     private readonly Matrix3d _blockTransform;
     private readonly TransientFrameMarkers _markers;
+#if AUTOCAD
+    private EditorUserInteraction? _cadPickUi;
+#endif
 
     // 存储每个已选字段的世界坐标角点，用于对话框重新显示时刷新全部临时标识。
     private readonly Dictionary<string, (Point3d Corner1, Point3d Corner2)> _fieldCorners = new(StringComparer.Ordinal);
@@ -792,24 +795,37 @@ public sealed class FieldBoxSelectDialog : Form
     }
 
     /// <summary>
-    /// 框选前让出 CAD 输入：透明+禁用，避免 Hide/Show 整窗拆装造成图面闪烁。
-    /// 若个别 CAD 仍抢不到点，再回退到 <see cref="CadWindowFocus.HideForCadInput"/>。
+    /// 框选前让出 CAD 输入：AutoCAD 用 Editor.StartUserInteraction；
+    /// ZWCAD 等无该 API 时用 Hide/Show，避免 Opacity/DoEvents 重入。
     /// </summary>
     private void BeginCadPick()
     {
-        Enabled = false;
-        Opacity = 0;
+#if AUTOCAD
+#if ACAD_CORE
+        _cadPickUi = _editor.StartUserInteraction(Handle);
+#else
+        _cadPickUi = _editor.StartUserInteraction(this);
+#endif
+#else
+        Hide();
         CadWindowFocus.ActivateCadWindow();
-        System.Windows.Forms.Application.DoEvents();
+#endif
     }
 
-    /// <summary>框选结束后恢复录入窗。</summary>
+    /// <summary>框选结束后恢复录入窗体。</summary>
     private void EndCadPick()
     {
-        Opacity = 1;
-        Enabled = true;
+#if AUTOCAD
+        if (_cadPickUi != null)
+        {
+            _cadPickUi.End();
+            _cadPickUi = null;
+        }
+#else
+        Show();
         BringToFront();
         Activate();
+#endif
     }
 
     private static void UpdateStatus(Label label, LocalRectangle region)

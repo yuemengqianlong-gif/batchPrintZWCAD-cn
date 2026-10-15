@@ -196,21 +196,46 @@ public sealed class CadSelectionWindow
         job.UcsMaxY = Math.Abs(yVec.Length);
     }
 
-    public static Matrix3d GetJobUcsToWorld(PlotJob job)
+        public static Matrix3d GetJobUcsToWorld(PlotJob job)
     {
+        var xAxis = new Vector3d(job.UcsXAxisX, job.UcsXAxisY, job.UcsXAxisZ);
+        var yAxis = new Vector3d(job.UcsYAxisX, job.UcsYAxisY, job.UcsYAxisZ);
+        // 退化数据（零向量/NaN）无法构成坐标系：个别 CAD 内核对非法矩阵会直接崩溃，
+        // 退回单位矩阵按 WCS 处理，红框方向可能不准但不会中断。
+        if (!IsFiniteVector(xAxis) || !IsFiniteVector(yAxis)
+            || xAxis.Length < 1e-12 || yAxis.Length < 1e-12)
+        {
+            return Matrix3d.Identity;
+        }
+
         var origin = new Point3d(job.UcsOriginX, job.UcsOriginY, job.UcsOriginZ);
-        var xAxis = new Vector3d(job.UcsXAxisX, job.UcsXAxisY, job.UcsXAxisZ).GetNormal();
-        var yAxis = new Vector3d(job.UcsYAxisX, job.UcsYAxisY, job.UcsYAxisZ).GetNormal();
-        var zAxis = xAxis.CrossProduct(yAxis).GetNormal();
+        var xUnit = xAxis.GetNormal();
+        var yUnit = yAxis.GetNormal();
+        var zUnit = xUnit.CrossProduct(yUnit);
+        if (zUnit.Length < 1e-12)
+        {
+            return Matrix3d.Identity;
+        }
+
         return Matrix3d.AlignCoordinateSystem(
             Point3d.Origin,
             Vector3d.XAxis,
             Vector3d.YAxis,
             Vector3d.ZAxis,
             origin,
-            xAxis,
-            yAxis,
-            zAxis);
+            xUnit,
+            yUnit,
+            zUnit.GetNormal());
+    }
+
+    private static bool IsFiniteVector(Vector3d vector)
+    {
+        return IsFiniteNumber(vector.X) && IsFiniteNumber(vector.Y) && IsFiniteNumber(vector.Z);
+    }
+
+    private static bool IsFiniteNumber(double value)
+    {
+        return !(double.IsNaN(value) || double.IsInfinity(value));
     }
 
     public static Point3d[] GetJobWorldCorners(PlotJob job)

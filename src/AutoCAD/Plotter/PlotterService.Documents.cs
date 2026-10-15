@@ -243,6 +243,40 @@ public static partial class PlotterService
         }
     }
 
+    /** IsPlotCancelledByUser：识别用户在预览窗按 ESC / 取消（eUserBreak、用户中断），不当作失败弹窗。 */
+    private static bool IsPlotCancelledByUser(Exception ex)
+    {
+        for (Exception? current = ex; current != null; current = current.InnerException)
+        {
+            if (current is OperationCanceledException)
+            {
+                return true;
+            }
+
+            var message = current.Message ?? "";
+            if (message.IndexOf("eUserBreak", StringComparison.OrdinalIgnoreCase) >= 0
+                || message.Contains("用户中断")
+                || message.Contains("已取消"))
+            {
+                return true;
+            }
+
+            // AutoCAD/ZWCAD 运行时异常带 ErrorStatus；反射兼容两个宿主。
+            var status = current.GetType().GetProperty("ErrorStatus");
+            if (status != null)
+            {
+                var value = status.GetValue(current, null)?.ToString() ?? "";
+                if (value.IndexOf("UserBreak", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+
     /** ValidatePlotOutput：校验输出文件存在且非空；PDF 再用 PdfSharp 打开验证。 */
     private static void ValidatePlotOutput(string outputPath)
     {

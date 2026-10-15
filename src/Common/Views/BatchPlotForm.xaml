@@ -2,7 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:ZwcadBatchPlot"
         x:Class="ZwcadBatchPlot.BatchPlotForm"
-        Title="LA图框块批量打印 V1.15.9"
+        Title="LA图框块批量打印 V1.15.10"
         Width="900" Height="520"
         MinWidth="720" MinHeight="460"
         WindowStartupLocation="CenterScreen"
@@ -65,11 +65,7 @@
                 <Button x:Name="_addFilesButton" Content="多文件批打" MinWidth="108"
                         Style="{StaticResource PluginButtonStyle}" Margin="0,0,3,0"
                         Click="AddDwgFiles_Click"
-                        ToolTip="选择一个或多个 DWG，勾选模型/布局后扫描并加入清单。" />
-                <Button x:Name="_addFolderButton" Content="多文件批打（文件夹）" MinWidth="148"
-                        Style="{StaticResource PluginButtonStyle}" Margin="0,0,3,0"
-                        Click="AddDwgFolder_Click"
-                        ToolTip="选择文件夹，自动收集其中（含子文件夹）全部 DWG，后续与多文件批打相同。" />
+                        ToolTip="选择一个或多个 DWG；也可点「选择文件夹」收集整个文件夹（含子文件夹）中的 DWG，勾选模型/布局后扫描并加入清单。" />
                 <Rectangle Width="1" Height="14" Fill="#CDCDCD"
                            Margin="4,0,12,0" VerticalAlignment="Center" />
                 <Button x:Name="_clearButton" Content="清空清单" MinWidth="92"

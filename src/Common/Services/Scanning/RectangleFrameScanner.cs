@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 #if AUTOCAD
 using Autodesk.AutoCAD.ApplicationServices;
@@ -13,9 +15,7 @@ using ZwSoft.ZwCAD.ApplicationServices;
 using ZwSoft.ZwCAD.DatabaseServices;
 using ZwSoft.ZwCAD.Geometry;
 #endif
-
 namespace ZwcadBatchPlot;
-
 /// <summary>
 /// 矩形框扫描器：扫描一个或多个布局中的闭合 Polyline 矩形；
 /// 用户开启对应设置后，也识别由 4 个独立直线或直线型开放 PL 首尾相连组成的矩形，
@@ -36,15 +36,12 @@ public static class RectangleFrameScanner
 {
     /// <summary>临时序号标注图层名，扫描时跳过此图层的实体。</summary>
     private const string TemporaryOverlayLayer = "ZBP_TEMP_SEQUENCE_OVERLAY";
-
     /// <summary>图层可扫描性缓存，避免每次查同一图层都打开图层表。
     /// 静态级缓存，同一次 CAD 会话内跨扫描复用。</summary>
     private static readonly Dictionary<ObjectId, bool> LayerScannableCache = new();
-
     /// <summary>块定义内容缓存：key=块定义 ObjectId，value=该块定义内的最大矩形（局部坐标）。
     /// 同一次扫描内同一块定义只遍历一次，后续实例直接变换缓存结果。</summary>
     private static readonly Dictionary<ObjectId, List<LocalRectangle>> BlockDefinitionCache = new();
-
     /// <summary>扫描结果：包含一个 PlotJob 和候选纸张列表。</summary>
     public sealed class Result
     {
@@ -54,7 +51,6 @@ public static class RectangleFrameScanner
         /// 用于 DCS 变换（4 点→DCS→取包围盒，和单张打印同理）。null 时用 Job 的包围盒。</summary>
         public double[]? CornerPoints { get; set; }
     }
-
     /// <summary>矩形扫描分阶段耗时（仅诊断用）。</summary>
     public sealed class ScanProfile
     {
@@ -78,7 +74,6 @@ public static class RectangleFrameScanner
         public int AfterEmptyFilterCount { get; set; }
         public int ResultCount { get; set; }
         public bool RecognizeFourLines { get; set; }
-
         public string FormatReport()
         {
             return string.Join(Environment.NewLine, new[]
@@ -92,25 +87,191 @@ public static class RectangleFrameScanner
             });
         }
     }
-
     /// <summary>为 true 时填充 <see cref="LastProfile"/>。</summary>
     public static bool EnableProfiling { get; set; }
-
     /// <summary>最近一次启用 Profiling 的扫描报告。</summary>
     public static ScanProfile? LastProfile { get; private set; }
-
     [ThreadStatic]
     private static ScanProfile? _activeProfile;
-
     [ThreadStatic]
     private static IProgress<RectangleScanProgress>? _activeProgress;
-
     [ThreadStatic]
     private static CancellationToken _activeCancel;
-
     /// <summary>本次扫描是否按图框库最多模式识别图名、图号。只在公共入口的 try/finally 内有效。</summary>
     private static bool _recognizeByDominantMode;
-
+    /// <summary>
+    /// 本次扫描的图框块名限定（「属性框配置 → 图框块名限定设置」）。
+    /// null 表示不限定（按原有逻辑识别）；非空时只有块名命中的图块才参与图框识别，
+    /// 其余图块整体跳过以排除干扰、加快识别。只在公共入口的 try/finally 内有效。
+    /// </summary>
+    private static Regex[]? _frameBlockNamePatterns;
+    /// <summary>本次扫描的图签属性标记（TAG）映射。只在公共入口的 try/finally 内有效。</summary>
+    private static IdentityTagMap? _identityTags;
+    /// <summary>「仅识别块图框」开关：勾选后打印区域只允许命中图框块名限定并验证过的图框块。
+    /// 仅在图框块名限定已启用时有意义，由 ScanAttributeContext 按设置维护。</summary>
+    private static bool _frameBlockOnlyMode;
+    /// <summary>
+    /// 图签属性标记映射：把图签属性块的 TAG 名称映射到图号/版次/图名/日期/信息1/信息2。
+    /// 默认图号→「图号」、图名→「图名」，与旧版硬编码行为一致；留空表示不参与识别。
+    /// </summary>
+    private sealed class IdentityTagMap
+    {
+        public string? DrawingNumber;
+        public string? Revision;
+        public string? Title;
+        public string? Date;
+        public string? Info1;
+        public string? Info2;
+        public static IdentityTagMap FromSettings(AppSettings settings)
+        {
+            return new IdentityTagMap
+            {
+                DrawingNumber = NullIfEmpty(settings.TitleBlockTagDrawingNumber),
+                Revision = NullIfEmpty(settings.TitleBlockTagRevision),
+                Title = NullIfEmpty(settings.TitleBlockTagTitle),
+                Date = NullIfEmpty(settings.TitleBlockTagDate),
+                Info1 = NullIfEmpty(settings.TitleBlockTagInfo1),
+                Info2 = NullIfEmpty(settings.TitleBlockTagInfo2)
+            };
+        }
+        private static string? NullIfEmpty(string value)
+        {
+            var trimmed = (value ?? "").Trim();
+            return trimmed.Length == 0 ? null : trimmed;
+        }
+    }
+    /// <summary>
+    /// 一次扫描的「属性框配置」上下文：进入时按设置启用图框块名限定与图签 TAG 映射，
+    /// Dispose 时恢复原值，避免侧载/后台线程之间相互污染。
+    /// </summary>
+    private readonly struct ScanAttributeContext : IDisposable
+    {
+        private readonly Regex[]? _previousPatterns;
+        private readonly IdentityTagMap? _previousTags;
+        private readonly bool _previousBlockOnlyMode;
+        public ScanAttributeContext(AppSettings settings)
+        {
+            _previousPatterns = _frameBlockNamePatterns;
+            _previousTags = _identityTags;
+            _previousBlockOnlyMode = _frameBlockOnlyMode;
+            _frameBlockNamePatterns = ParseFrameBlockNameFilter(settings.FrameBlockNameFilter);
+            _identityTags = IdentityTagMap.FromSettings(settings);
+            // 「仅识别块图框」只在图框块名限定启用时生效；未限定块名时没有可独占的图框块集合。
+            _frameBlockOnlyMode = settings.FrameBlockOnlyMode && _frameBlockNamePatterns != null;
+        }
+        public void Dispose()
+        {
+            _frameBlockNamePatterns = _previousPatterns;
+            _identityTags = _previousTags;
+            _frameBlockOnlyMode = _previousBlockOnlyMode;
+        }
+    }
+    /// <summary>把「图框名」设置解析为通配符正则数组；空白返回 null（不限定）。</summary>
+    private static Regex[]? ParseFrameBlockNameFilter(string filter)
+    {
+        var patterns = (filter ?? "")
+            .Split(new[] { ',', '，' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(p => p.Trim())
+            .Where(p => p.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        return patterns.Length == 0
+            ? null
+            : patterns.Select(ConvertBlockNamePatternToRegex).ToArray();
+    }
+    /// <summary>把 CAD 通配符（* ? #）转换为正则；其余字符按字面匹配，忽略大小写。</summary>
+    private static Regex ConvertBlockNamePatternToRegex(string pattern)
+    {
+        var sb = new StringBuilder();
+        foreach (var ch in pattern)
+        {
+            switch (ch)
+            {
+                case '*':
+                    sb.Append(".*");
+                    break;
+                case '?':
+                    sb.Append('.');
+                    break;
+                case '#':
+                    sb.Append("[0-9]");
+                    break;
+                default:
+                    sb.Append(Regex.Escape(ch.ToString()));
+                    break;
+            }
+        }
+        return new Regex("^" + sb + "$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+    /// <summary>判断块参照名称是否命中图框块名限定；未启用限定时恒为 true。</summary>
+    private static bool IsBlockAllowedByFrameFilter(BlockReference blockReference)
+    {
+        var patterns = _frameBlockNamePatterns;
+        if (patterns == null)
+        {
+            return true;
+        }
+        string name;
+        try
+        {
+            name = blockReference.Name ?? "";
+        }
+        catch
+        {
+            return false;
+        }
+        foreach (var pattern in patterns)
+        {
+            if (pattern.IsMatch(name))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    /// <summary>
+    /// 汇总当前图签 TAG 映射中已配置的标记名（图号、图名等）。
+    /// 全部未配置时返回 null，表示不要求块内必须含属性标记。
+    /// </summary>
+    private static HashSet<string>? GetConfiguredIdentityTagSet()
+    {
+        var tags = _identityTags;
+        if (tags == null)
+        {
+            return null;
+        }
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(tags.DrawingNumber))
+        {
+            set.Add(tags.DrawingNumber!.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(tags.Revision))
+        {
+            set.Add(tags.Revision!.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(tags.Title))
+        {
+            set.Add(tags.Title!.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(tags.Date))
+        {
+            set.Add(tags.Date!.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(tags.Info1))
+        {
+            set.Add(tags.Info1!.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(tags.Info2))
+        {
+            set.Add(tags.Info2!.Trim());
+        }
+        return set.Count == 0 ? null : set;
+    }
+    /// <summary>
+    /// 判断命中图框块名限定的块参照内（含嵌套块、已解析的外部参照）是否存在
+    /// 图签 TAG 映射中配置的属性标记（图号、图名等）。映射全部为空时不要求属性，
+    /// 任何命中限定名的块参照都视为有效图框块。
+    /// </summary>
     private static void ReportScan(string detail, int current = 0, int total = 0, string? title = null)
     {
         _activeCancel.ThrowIfCancellationRequested();
@@ -122,11 +283,9 @@ public static class RectangleFrameScanner
             Total = total
         });
     }
-
     // ═══════════════════════════════════════════════════════════════
     // 公共入口
     // ═══════════════════════════════════════════════════════════════
-
     /// <summary>
     /// 扫描指定窗口内的矩形框（仅当前空间），每个匹配的矩形生成一个 PlotJob。
     /// </summary>
@@ -155,7 +314,6 @@ public static class RectangleFrameScanner
             recognizeFourLineRectangles,
             recognizeTitleByDominantFrameMode: recognizeTitleByDominantFrameMode);
     }
-
     /// <summary>
     /// 按用户当前 UCS 中的矩形窗口扫描。Bounds 保持 UCS 原始宽高，WCS 只用于数据库实体读取。
     /// </summary>
@@ -179,13 +337,13 @@ public static class RectangleFrameScanner
             LayerScannableCache.Clear();
             BlockDefinitionCache.Clear();
             var storedSettings = AppSettingsStore.Load();
+            using var attributeScanContext = new ScanAttributeContext(storedSettings);
             var effectivePaperToleranceMm = paperMatchToleranceMm ?? storedSettings.PaperMatchToleranceMm;
             var recognizeFourLines =
                 recognizeFourLineRectangles ?? storedSettings.RecognizeFourLineRectangleFrames;
             var sourceFile = string.IsNullOrWhiteSpace(document.Database.Filename)
                 ? document.Name
                 : document.Database.Filename;
-
             ReportScan("正在读取当前空间…");
             using var tr = document.Database.TransactionManager.StartTransaction();
             BlockTableRecord owner;
@@ -199,7 +357,6 @@ public static class RectangleFrameScanner
                 {
                     return new List<Result>();
                 }
-
                 layout = (Layout)tr.GetObject(owner.LayoutId, OpenMode.ForRead);
             }
             else
@@ -210,7 +367,6 @@ public static class RectangleFrameScanner
                 {
                     return new List<Result>();
                 }
-
                 layout = (Layout)tr.GetObject(layouts.GetAt(currentLayoutName), OpenMode.ForRead);
                 owner = (BlockTableRecord)tr.GetObject(layout.BlockTableRecordId, OpenMode.ForRead);
                 if (!owner.IsLayout || owner.LayoutId.IsNull)
@@ -218,14 +374,12 @@ public static class RectangleFrameScanner
                     return new List<Result>();
                 }
             }
-
             var rectangles = CollectRectanglesFromSpace(tr, owner, recognizeFourLines, layout.LayoutName);
             var ownerId = owner.ObjectId;
             var layoutName = layout.LayoutName;
             var layoutTabOrder = layout.TabOrder;
             var isPaperSpace = !layout.ModelType;
             tr.Commit();
-
             return FilterAndPackageRectangles(
                 document.Database,
                 rectangles,
@@ -246,7 +400,6 @@ public static class RectangleFrameScanner
             _activeCancel = previousCancel;
         }
     }
-
     /// <summary>
     /// 按扫描范围扫描多个布局中的矩形框。
     ///
@@ -271,16 +424,15 @@ public static class RectangleFrameScanner
         _activeProgress = progress;
         _activeCancel = cancellationToken;
         _recognizeByDominantMode = recognizeTitleByDominantFrameMode;
-
         var profile = EnableProfiling ? new ScanProfile() : null;
         _activeProfile = profile;
         var totalSw = profile != null ? Stopwatch.StartNew() : null;
-
         try
         {
             LayerScannableCache.Clear();
             BlockDefinitionCache.Clear();
             var storedSettings = AppSettingsStore.Load();
+            using var attributeScanContext = new ScanAttributeContext(storedSettings);
             var effectivePaperToleranceMm = paperMatchToleranceMm ?? storedSettings.PaperMatchToleranceMm;
             var recognizeFourLines =
                 recognizeFourLineRectangles ?? storedSettings.RecognizeFourLineRectangleFrames;
@@ -288,14 +440,11 @@ public static class RectangleFrameScanner
             {
                 profile.RecognizeFourLines = recognizeFourLines;
             }
-
             var sourceFile = string.IsNullOrWhiteSpace(document.Database.Filename)
                 ? document.Name
                 : document.Database.Filename;
             var currentSpaceName = GetCurrentSpaceName(document.Database);
-
             ReportScan("正在枚举布局…");
-
             // 第一阶段：在事务内遍历所有匹配布局，收集矩形
             var spaceData = new List<(List<LocalRectangle> Rectangles, ObjectId OwnerId, string LayoutName, bool IsPaperSpace, int TabOrder)>();
             var collectSpacesSw = profile != null ? Stopwatch.StartNew() : null;
@@ -311,16 +460,13 @@ public static class RectangleFrameScanner
                     {
                         continue;
                     }
-
                     var layout = (Layout)tr.GetObject(owner.LayoutId, OpenMode.ForRead);
                     if (!ShouldScanLayout(layout, scope, currentSpaceName, allowedLayoutNames))
                     {
                         continue;
                     }
-
                     pendingLayouts.Add((owner, layout));
                 }
-
                 for (var layoutIndex = 0; layoutIndex < pendingLayouts.Count; layoutIndex++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -329,7 +475,6 @@ public static class RectangleFrameScanner
                     {
                         profile.LayoutCount++;
                     }
-
                     ReportScan(
                         $"正在收集矩形（{layout.LayoutName}）…",
                         layoutIndex + 1,
@@ -341,19 +486,15 @@ public static class RectangleFrameScanner
                         layout.LayoutName);
                     spaceData.Add((rectangles, owner.ObjectId, layout.LayoutName, !layout.ModelType, layout.TabOrder));
                 }
-
                 tr.Commit();
             }
-
             if (collectSpacesSw != null && profile != null)
             {
                 collectSpacesSw.Stop();
                 profile.CollectSpacesMs = collectSpacesSw.ElapsedMilliseconds;
             }
-
             // 按布局 TabOrder 排序，确保模型空间在最前、图纸布局按选项卡顺序排列
             spaceData.Sort((a, b) => a.TabOrder.CompareTo(b.TabOrder));
-
             // 第二阶段：对每个空间独立过滤打包（FilterEmptyRectangles 内会开自己的事务）
             var filterSw = profile != null ? Stopwatch.StartNew() : null;
             var allResults = new List<Result>();
@@ -381,21 +522,18 @@ public static class RectangleFrameScanner
                     storedSettings.CustomScales);
                 allResults.AddRange(results);
             }
-
             if (filterSw != null && profile != null)
             {
                 filterSw.Stop();
                 profile.FilterPackageMs = filterSw.ElapsedMilliseconds;
                 profile.ResultCount = allResults.Count;
             }
-
             if (totalSw != null && profile != null)
             {
                 totalSw.Stop();
                 profile.TotalMs = totalSw.ElapsedMilliseconds;
                 LastProfile = profile;
             }
-
             ReportScan($"识别完成，共 {allResults.Count} 个图框", allResults.Count, Math.Max(1, allResults.Count));
             return allResults;
         }
@@ -407,7 +545,6 @@ public static class RectangleFrameScanner
             _activeCancel = previousCancel;
         }
     }
-
     /// <summary>
     /// 只扫描给定 ObjectId 集合中的实体（块参照、多段线，以及开启四线识别时的直线）。
     /// 空或 null 返回空列表；无法打开的 id 会被忽略。结果形状与 <see cref="ScanWindow"/> / <see cref="ScanScope"/> 相同。
@@ -433,7 +570,6 @@ public static class RectangleFrameScanner
             {
                 return new List<Result>();
             }
-
             var idList = new List<ObjectId>();
             foreach (var id in selectedIds)
             {
@@ -442,24 +578,21 @@ public static class RectangleFrameScanner
                     idList.Add(id);
                 }
             }
-
             if (idList.Count == 0)
             {
                 return new List<Result>();
             }
-
             LayerScannableCache.Clear();
             BlockDefinitionCache.Clear();
             var storedSettings = AppSettingsStore.Load();
+            using var attributeScanContext = new ScanAttributeContext(storedSettings);
             var effectivePaperToleranceMm = paperMatchToleranceMm ?? storedSettings.PaperMatchToleranceMm;
             var recognizeFourLines =
                 recognizeFourLineRectangles ?? storedSettings.RecognizeFourLineRectangleFrames;
             var sourceFile = string.IsNullOrWhiteSpace(document.Database.Filename)
                 ? document.Name
                 : document.Database.Filename;
-
             ReportScan("正在读取选中对象…");
-
             var spaceData = new List<(List<LocalRectangle> Rectangles, ObjectId OwnerId, string LayoutName, bool IsPaperSpace, int TabOrder)>();
             using (var tr = document.Database.TransactionManager.StartTransaction())
             {
@@ -477,18 +610,15 @@ public static class RectangleFrameScanner
                     {
                         continue;
                     }
-
                     if (entity == null)
                     {
                         continue;
                     }
-
                     var ownerId = entity.OwnerId;
                     if (ownerId.IsNull)
                     {
                         continue;
                     }
-
                     if (!owners.TryGetValue(ownerId, out var ownerInfo))
                     {
                         BlockTableRecord? owner;
@@ -500,7 +630,6 @@ public static class RectangleFrameScanner
                             {
                                 continue;
                             }
-
                             layout = tr.GetObject(owner.LayoutId, OpenMode.ForRead, false) as Layout;
                             if (layout == null)
                             {
@@ -511,15 +640,12 @@ public static class RectangleFrameScanner
                         {
                             continue;
                         }
-
                         ownerInfo = (owner, layout);
                         owners[ownerId] = ownerInfo;
                         groups[ownerId] = new List<ObjectId>();
                     }
-
                     groups[ownerId].Add(id);
                 }
-
                 foreach (var pair in groups)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -532,12 +658,9 @@ public static class RectangleFrameScanner
                         layout.LayoutName);
                     spaceData.Add((rectangles, owner.ObjectId, layout.LayoutName, !layout.ModelType, layout.TabOrder));
                 }
-
                 tr.Commit();
             }
-
             spaceData.Sort((a, b) => a.TabOrder.CompareTo(b.TabOrder));
-
             var allResults = new List<Result>();
             for (var i = 0; i < spaceData.Count; i++)
             {
@@ -563,7 +686,6 @@ public static class RectangleFrameScanner
                     storedSettings.CustomScales);
                 allResults.AddRange(results);
             }
-
             ReportScan($"识别完成，共 {allResults.Count} 个图框", allResults.Count, Math.Max(1, allResults.Count));
             return allResults;
         }
@@ -574,7 +696,6 @@ public static class RectangleFrameScanner
             _activeCancel = previousCancel;
         }
     }
-
     /// <summary>
     /// 侧载扫描：用已打开的 <see cref="Database"/>（通常来自 ReadDwgFile）按范围/布局名过滤扫描矩形框。
     /// 不依赖 Document/Editor；模型空间坐标保持 WCS，不向当前图绘制 overlay。
@@ -596,16 +717,15 @@ public static class RectangleFrameScanner
         _activeProgress = progress;
         _activeCancel = cancellationToken;
         _recognizeByDominantMode = recognizeTitleByDominantFrameMode;
-
         var profile = EnableProfiling ? new ScanProfile() : null;
         _activeProfile = profile;
         var totalSw = profile != null ? Stopwatch.StartNew() : null;
-
         try
         {
             LayerScannableCache.Clear();
             BlockDefinitionCache.Clear();
             var storedSettings = AppSettingsStore.Load();
+            using var attributeScanContext = new ScanAttributeContext(storedSettings);
             var effectivePaperToleranceMm = paperMatchToleranceMm ?? storedSettings.PaperMatchToleranceMm;
             var recognizeFourLines =
                 recognizeFourLineRectangles ?? storedSettings.RecognizeFourLineRectangleFrames;
@@ -613,14 +733,11 @@ public static class RectangleFrameScanner
             {
                 profile.RecognizeFourLines = recognizeFourLines;
             }
-
             if (string.IsNullOrWhiteSpace(sourceFile))
             {
                 sourceFile = db.Filename ?? "";
             }
-
             ReportScan("正在枚举布局…");
-
             var spaceData = new List<(List<LocalRectangle> Rectangles, ObjectId OwnerId, string LayoutName, bool IsPaperSpace, int TabOrder)>();
             var collectSpacesSw = profile != null ? Stopwatch.StartNew() : null;
             using (var tr = db.TransactionManager.StartTransaction())
@@ -635,7 +752,6 @@ public static class RectangleFrameScanner
                     {
                         continue;
                     }
-
                     var layout = (Layout)tr.GetObject(owner.LayoutId, OpenMode.ForRead);
                     // 侧载无当前空间概念；CurrentSpace 视为全部空间后再按 allowedLayoutNames 过滤。
                     var effectiveScope = scope == TitleBlockScanScope.CurrentSpace
@@ -645,10 +761,8 @@ public static class RectangleFrameScanner
                     {
                         continue;
                     }
-
                     pendingLayouts.Add((owner, layout));
                 }
-
                 for (var layoutIndex = 0; layoutIndex < pendingLayouts.Count; layoutIndex++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -657,7 +771,6 @@ public static class RectangleFrameScanner
                     {
                         profile.LayoutCount++;
                     }
-
                     ReportScan(
                         $"正在收集矩形（{layout.LayoutName}）…",
                         layoutIndex + 1,
@@ -669,18 +782,14 @@ public static class RectangleFrameScanner
                         layout.LayoutName);
                     spaceData.Add((rectangles, owner.ObjectId, layout.LayoutName, !layout.ModelType, layout.TabOrder));
                 }
-
                 tr.Commit();
             }
-
             if (collectSpacesSw != null && profile != null)
             {
                 collectSpacesSw.Stop();
                 profile.CollectSpacesMs = collectSpacesSw.ElapsedMilliseconds;
             }
-
             spaceData.Sort((a, b) => a.TabOrder.CompareTo(b.TabOrder));
-
             var filterSw = profile != null ? Stopwatch.StartNew() : null;
             var allResults = new List<Result>();
             for (var i = 0; i < spaceData.Count; i++)
@@ -708,24 +817,20 @@ public static class RectangleFrameScanner
                 {
                     result.Job.IsDcsWindow = false;
                 }
-
                 allResults.AddRange(results);
             }
-
             if (filterSw != null && profile != null)
             {
                 filterSw.Stop();
                 profile.FilterPackageMs = filterSw.ElapsedMilliseconds;
                 profile.ResultCount = allResults.Count;
             }
-
             if (totalSw != null && profile != null)
             {
                 totalSw.Stop();
                 profile.TotalMs = totalSw.ElapsedMilliseconds;
                 LastProfile = profile;
             }
-
             ReportScan($"识别完成，共 {allResults.Count} 个图框", allResults.Count, Math.Max(1, allResults.Count));
             return allResults;
         }
@@ -737,11 +842,9 @@ public static class RectangleFrameScanner
             _activeCancel = previousCancel;
         }
     }
-
     // ═══════════════════════════════════════════════════════════════
     // 内部：单空间收集 & 过滤打包
     // ═══════════════════════════════════════════════════════════════
-
     /// <summary>
     /// 遍历单个空间内的闭合 PL 矩形；开关开启时，同时收集顶层独立直线/直线型 PL，
     /// 经四叉树找出四边闭环后转换为同一个 LocalRectangle 流程。
@@ -779,7 +882,6 @@ public static class RectangleFrameScanner
                         0);
                 }
             }
-
             topLevelVisits++;
             DBObject? obj;
             try
@@ -790,23 +892,18 @@ public static class RectangleFrameScanner
             {
                 continue;
             }
-
             if (!ScanCandidateFilter.IsRectangleFrameCandidate(obj, recognizeFourLineRectangles))
             {
                 continue;
             }
-
             candidateIds.Add(id);
         }
-
         if (profile != null)
         {
             profile.TopLevelEntityVisits += topLevelVisits;
         }
-
         return CollectRectanglesFromEntities(tr, candidateIds, recognizeFourLineRectangles, layoutName);
     }
-
     /// <summary>
     /// 只遍历给定实体（对象选择路径），其余矩形检测与四线拼合规则与空间扫描一致。
     /// </summary>
@@ -830,20 +927,17 @@ public static class RectangleFrameScanner
                 {
                     continue;
                 }
-
                 entity = tr.GetObject(id, OpenMode.ForRead, false) as Entity;
             }
             catch
             {
                 continue;
             }
-
             if (entity == null
                 || !ScanCandidateFilter.IsRectangleFrameCandidate(entity, recognizeFourLineRectangles))
             {
                 continue;
             }
-
             topLevelVisits++;
             CollectEntityRectangles(
                 tr,
@@ -855,7 +949,6 @@ public static class RectangleFrameScanner
                 0,
                 recognizeFourLineRectangles);
         }
-
         if (entitySw != null && profile != null)
         {
             entitySw.Stop();
@@ -867,7 +960,6 @@ public static class RectangleFrameScanner
                 profile.LineSegmentCount += segments.Count;
             }
         }
-
         if (segments != null && segments.Count >= 4)
         {
             _activeCancel.ThrowIfCancellationRequested();
@@ -887,10 +979,8 @@ public static class RectangleFrameScanner
                 profile.FourLineRectCount += rectangles.Count - before;
             }
         }
-
         return rectangles;
     }
-
     /// <summary>
     /// 对一个空间内收集到的矩形做完整的过滤流水线并打包为 Result 列表。
     ///
@@ -921,7 +1011,6 @@ public static class RectangleFrameScanner
         {
             inWindow = rectangles.ToList();
         }
-
         // 3b. 纸张标准比例过滤
         var profile = _activeProfile;
         var paperSw = profile != null ? Stopwatch.StartNew() : null;
@@ -940,7 +1029,6 @@ public static class RectangleFrameScanner
                     paperIndex,
                     Math.Max(1, paperTotal));
             }
-
             var rectangle = inWindow[paperIndex];
             var coordinateBounds = !isPaperSpace
                                    && coordinateContext != null
@@ -954,13 +1042,12 @@ public static class RectangleFrameScanner
                 ? coordinateBounds.MaxY - coordinateBounds.MinY
                 : rectangle.ActualHeight > 0 ? rectangle.ActualHeight : rectangle.MaxY - rectangle.MinY;
             // 比例库短边毫米匹配；失败则长宽比任意比例，并展开 A0~A4 供改纸。
-            var detectionOptions = PaperSizeDetector.CreateRectangleBatchOptions(paperMatchToleranceMm, isPaperSpace, longPaperSnapToleranceMm, customScales);
+            var detectionOptions = PaperSizeDetector.CreateRectangleBatchOptions(paperMatchToleranceMm, isPaperSpace, longPaperSnapToleranceMm, customScales, AppSettingsStore.Load().RemovedBuiltInScales);
             var options = PaperSizeDetector.DetectRectangleBatchCandidates(width, height, detectionOptions);
             if (options.Count == 0)
             {
                 continue;
             }
-
             paperMatched.Add(rectangle);
             paperOptionsByRect[rectangle] = options;
             if (coordinateBounds != null)
@@ -968,14 +1055,12 @@ public static class RectangleFrameScanner
                 coordinateBoundsByRect[rectangle] = coordinateBounds;
             }
         }
-
         if (paperSw != null && profile != null)
         {
             paperSw.Stop();
             profile.PaperMatchMs += paperSw.ElapsedMilliseconds;
             profile.AfterPaperMatchCount += paperMatched.Count;
         }
-
         // 3c. 去重去嵌套
         var dedupSw = profile != null ? Stopwatch.StartNew() : null;
         var unique = FilterRectangles(paperMatched);
@@ -985,7 +1070,6 @@ public static class RectangleFrameScanner
             profile.DedupMs += dedupSw.ElapsedMilliseconds;
             profile.AfterDedupCount += unique.Count;
         }
-
         // 3d. 空框过滤
         ReportScan("正在检查空框…");
         var emptySw = profile != null ? Stopwatch.StartNew() : null;
@@ -996,7 +1080,6 @@ public static class RectangleFrameScanner
             profile.EmptyFilterMs += emptySw.ElapsedMilliseconds;
             profile.AfterEmptyFilterCount += withContent.Count;
         }
-
         // 3e. 生成结果
         var results = new List<Result>();
         var packedRectangles = new List<LocalRectangle>(withContent.Count);
@@ -1048,18 +1131,15 @@ public static class RectangleFrameScanner
             {
                 coordinateContext.ApplyToJob(result.Job, coordinateBounds);
             }
-
             results.Add(result);
             packedRectangles.Add(rectangle);
         }
-
         // 3f. 勾选时先按图框库最多模式，在本空间里取图名/图号；没取到的再退回属性 Tag。
         if (_recognizeByDominantMode)
         {
             ReportScan("正在按图框模式识别图名/图号…");
             FillDominantModeIdentities(database, ownerId, results, packedRectangles);
         }
-
         ReportScan("正在识别图号/图名属性…");
         var attrSw = _activeProfile != null ? Stopwatch.StartNew() : null;
         FillAttributeIdentities(database, ownerId, results, packedRectangles);
@@ -1068,10 +1148,8 @@ public static class RectangleFrameScanner
             attrSw.Stop();
             _activeProfile.AttributeFillMs += attrSw.ElapsedMilliseconds;
         }
-
         return results;
     }
-
     /// <summary>
     /// 用图框库中数量最多的模式，把图名、图号矩形放到每张图的右下角，并在同一空间取字。
     /// 纸面毫米按这张图外框短边和纸张短边的实际比例放大。
@@ -1086,7 +1164,6 @@ public static class RectangleFrameScanner
         {
             return;
         }
-
         var blockFrames = ScanTitleBlockFrames(database, TryGetLayoutName(database, ownerId));
         try
         {
@@ -1099,7 +1176,6 @@ public static class RectangleFrameScanner
                 {
                     ReportScan("正在按图框模式识别图名/图号…", i, results.Count);
                 }
-
                 var job = results[i].Job;
                 if (!TryCreateFrameAxes(
                         rectangles[i],
@@ -1110,14 +1186,12 @@ public static class RectangleFrameScanner
                 {
                     continue;
                 }
-
                 var title = ExtractCellText(cache, axes, titleBox);
                 if (!string.IsNullOrWhiteSpace(title))
                 {
                     job.CadTitle = title;
                     job.Title = title;
                 }
-
                 var number = ExtractCellText(cache, axes, numberBox);
                 if (!string.IsNullOrWhiteSpace(number))
                 {
@@ -1125,7 +1199,6 @@ public static class RectangleFrameScanner
                     job.DrawingNumber = number;
                 }
             }
-
             tr.Commit();
         }
         catch (OperationCanceledException)
@@ -1137,7 +1210,6 @@ public static class RectangleFrameScanner
             // 模式取字失败时留给属性 Tag 回退，不中断整次扫描。
         }
     }
-
     /// <summary>
     /// 用户改纸后，按新纸张短边用图框库最多模式重取图名、图号。
     /// 角点沿用扫描时的 WCS 或图纸空间四角。新窗口取到字就覆盖；取不到则清空，再按属性 Tag 回退。
@@ -1148,7 +1220,6 @@ public static class RectangleFrameScanner
         {
             return;
         }
-
         var ready = new List<(PlotJob Job, LocalRectangle Rectangle)>();
         foreach (var job in jobs)
         {
@@ -1157,19 +1228,16 @@ public static class RectangleFrameScanner
                 ready.Add((job, rectangle));
             }
         }
-
         if (ready.Count == 0)
         {
             return;
         }
-
         var attributePass = new List<(ObjectId OwnerId, List<Result> Results, List<LocalRectangle> Rectangles)>();
         var blockFramesBySpace = new Dictionary<string, List<double[]>>(StringComparer.OrdinalIgnoreCase);
         foreach (var spaceName in ready.Select(item => item.Job.SpaceName ?? "").Distinct(StringComparer.OrdinalIgnoreCase))
         {
             blockFramesBySpace[spaceName] = ScanTitleBlockFrames(database, spaceName);
         }
-
         try
         {
             using var tr = database.TransactionManager.StartTransaction();
@@ -1180,7 +1248,6 @@ public static class RectangleFrameScanner
                 {
                     continue;
                 }
-
                 var owner = (BlockTableRecord)tr.GetObject(ownerId, OpenMode.ForRead);
                 var spaceItems = spaceGroup.ToList();
                 var blockFrames = blockFramesBySpace.TryGetValue(spaceGroup.Key, out var frames)
@@ -1205,7 +1272,6 @@ public static class RectangleFrameScanner
                             title = ExtractCellText(cache, axes, titleBox);
                             number = ExtractCellText(cache, axes, numberBox);
                         }
-
                         item.Job.CadTitle = title ?? "";
                         item.Job.Title = title ?? "";
                         item.Job.CadDrawingNumber = number ?? "";
@@ -1215,27 +1281,22 @@ public static class RectangleFrameScanner
                     {
                         // 这一张取字失败时保留改纸前的图名图号。
                     }
-
                     results.Add(new Result { Job = item.Job, CornerPoints = item.Rectangle.CornerPoints });
                     rectangles.Add(item.Rectangle);
                 }
-
                 attributePass.Add((ownerId, results, rectangles));
             }
-
             tr.Commit();
         }
         catch
         {
             return;
         }
-
         foreach (var pass in attributePass)
         {
             FillAttributeIdentities(database, pass.OwnerId, pass.Results, pass.Rectangles);
         }
     }
-
     /// <summary>用作业上保留的扫描角点还原取字矩形。Min/Max 已转成 DCS 时不能拿来套文字。</summary>
     private static bool TryCreateIdentityRectangle(PlotJob job, out LocalRectangle rectangle)
     {
@@ -1244,7 +1305,6 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         var minX = points[0];
         var minY = points[1];
         var maxX = points[0];
@@ -1258,7 +1318,6 @@ public static class RectangleFrameScanner
             maxX = Math.Max(maxX, x);
             maxY = Math.Max(maxY, y);
         }
-
         rectangle.MinX = minX;
         rectangle.MinY = minY;
         rectangle.MaxX = maxX;
@@ -1266,7 +1325,6 @@ public static class RectangleFrameScanner
         rectangle.CornerPoints = points;
         return true;
     }
-
     /// <summary>按布局名打开该空间的块表记录。</summary>
     private static bool TryGetSpaceOwner(Transaction tr, Database database, string spaceName, out ObjectId ownerId)
     {
@@ -1276,17 +1334,14 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         if (tr.GetObject(layouts.GetAt(spaceName), OpenMode.ForRead, false) is not Layout layout
             || layout.BlockTableRecordId.IsNull)
         {
             return false;
         }
-
         ownerId = layout.BlockTableRecordId;
         return true;
     }
-
     /// <summary>图框库聚类后成员最多的那一组图名、图号纸面矩形。</summary>
     private static bool TryGetDominantMode(out PaperCornerBox title, out PaperCornerBox number)
     {
@@ -1297,12 +1352,10 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         title = modes[0].Title;
         number = modes[0].Number;
         return true;
     }
-
     /// <summary>右下角为原点，底边朝左、右边朝上。长度是这条边的绘图单位。</summary>
     private readonly struct FrameAxes
     {
@@ -1313,13 +1366,11 @@ public static class RectangleFrameScanner
             Up = up;
             CadPerMm = cadPerMm;
         }
-
         public Point3d Origin { get; }
         public Vector3d Left { get; }
         public Vector3d Up { get; }
         public double CadPerMm { get; }
     }
-
     /// <summary>
     /// 图框块扫描给出的角点顺序是块内左下、右下、右上、左上，右下角才是图名图号基点。
     /// 对得上图框块时用这个右下角；对不上再退回世界坐标最右最下。
@@ -1336,10 +1387,8 @@ public static class RectangleFrameScanner
         {
             return true;
         }
-
         return TryCreateFrameAxes(rectangle, paperWidthMm, paperHeightMm, out axes);
     }
-
     /// <summary>
     /// 右下角取四个角里最靠右、再最靠下的那个。两条邻边里更朝左的是底边，另一条是右边向上。
     /// </summary>
@@ -1351,13 +1400,11 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         var points = GetWorldPoints(rectangle);
         if (points.Length < 4)
         {
             return false;
         }
-
         var bottomRight = 0;
         for (var i = 1; i < 4; i++)
         {
@@ -1367,7 +1414,6 @@ public static class RectangleFrameScanner
                 bottomRight = i;
             }
         }
-
         var origin = points[bottomRight];
         var previous = points[(bottomRight + 3) % 4] - origin;
         var next = points[(bottomRight + 1) % 4] - origin;
@@ -1375,7 +1421,6 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         // 更朝左（X 更小，X 相近时 Y 更小）的邻边沿底边离开右下角。
         var previousIsBottom = previous.X < next.X - 1e-6
             || (Math.Abs(previous.X - next.X) <= 1e-6 && previous.Y <= next.Y);
@@ -1386,11 +1431,9 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         axes = new FrameAxes(origin, alongBottom.GetNormal(), alongRight.GetNormal(), cadPerMm);
         return true;
     }
-
     /// <summary>
     /// 用图框块扫描的世界角点建坐标系。角点顺序与块内一致：左下、右下、右上、左上。
     /// 原点是块内右下角，底边指向左下，右边指向上。
@@ -1407,7 +1450,6 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         var origin = new Point3d(corners[2], corners[3], 0);
         var alongBottom = new Point3d(corners[0], corners[1], 0) - origin;
         var alongRight = new Point3d(corners[4], corners[5], 0) - origin;
@@ -1415,17 +1457,14 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         var cadPerMm = Math.Min(alongBottom.Length, alongRight.Length) / paperShort;
         if (cadPerMm < 1e-9)
         {
             return false;
         }
-
         axes = new FrameAxes(origin, alongBottom.GetNormal(), alongRight.GetNormal(), cadPerMm);
         return true;
     }
-
     /// <summary>只扫描指定布局里的图框块，取出已经按块旋转算好的四角。</summary>
     private static List<double[]> ScanTitleBlockFrames(Database database, string layoutName)
     {
@@ -1434,7 +1473,6 @@ public static class RectangleFrameScanner
         {
             return frames;
         }
-
         try
         {
             var allowed = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { layoutName };
@@ -1456,10 +1494,8 @@ public static class RectangleFrameScanner
         {
             // 图框块扫描失败时退回世界坐标右下角，不中断通用型扫描。
         }
-
         return frames;
     }
-
     /// <summary>按块表记录反查布局名，供图框块扫描限定空间。</summary>
     private static string TryGetLayoutName(Database database, ObjectId ownerId)
     {
@@ -1473,7 +1509,6 @@ public static class RectangleFrameScanner
             {
                 return "";
             }
-
             var name = layout.LayoutName ?? "";
             tr.Commit();
             return name;
@@ -1483,7 +1518,6 @@ public static class RectangleFrameScanner
             return "";
         }
     }
-
     /// <summary>
     /// 矩形外框与图框块打印边界互相包含中心时，采用该图框块的四角。
     /// 多张重叠时取中心更近的一张。
@@ -1494,7 +1528,6 @@ public static class RectangleFrameScanner
         {
             return null;
         }
-
         var centerX = (rectangle.MinX + rectangle.MaxX) * 0.5;
         var centerY = (rectangle.MinY + rectangle.MaxY) * 0.5;
         double[]? best = null;
@@ -1505,7 +1538,6 @@ public static class RectangleFrameScanner
             {
                 continue;
             }
-
             var blockCenterX = (minX + maxX) * 0.5;
             var blockCenterY = (minY + maxY) * 0.5;
             var rectangleContainsBlock = ContainsPoint(rectangle.MinX, rectangle.MinY, rectangle.MaxX, rectangle.MaxY, blockCenterX, blockCenterY);
@@ -1514,7 +1546,6 @@ public static class RectangleFrameScanner
             {
                 continue;
             }
-
             var dx = blockCenterX - centerX;
             var dy = blockCenterY - centerY;
             var distance = dx * dx + dy * dy;
@@ -1524,10 +1555,8 @@ public static class RectangleFrameScanner
                 best = corners;
             }
         }
-
         return best;
     }
-
     /// <summary>四角的轴对齐范围。</summary>
     private static bool TryGetCornerBounds(
         double[] corners,
@@ -1544,7 +1573,6 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         minX = maxX = corners[0];
         minY = maxY = corners[1];
         for (var i = 1; i < 4; i++)
@@ -1556,10 +1584,8 @@ public static class RectangleFrameScanner
             maxX = Math.Max(maxX, x);
             maxY = Math.Max(maxY, y);
         }
-
         return maxX - minX > 1e-6 && maxY - minY > 1e-6;
     }
-
     /// <summary>点是否落在矩形内，边界放宽 1 个绘图单位。</summary>
     private static bool ContainsPoint(double minX, double minY, double maxX, double maxY, double x, double y)
     {
@@ -1569,7 +1595,6 @@ public static class RectangleFrameScanner
             && y >= minY - tolerance
             && y <= maxY + tolerance;
     }
-
     /// <summary>
     /// 在这张图的右下角坐标系里取纸面矩形内的文字。局部 X 为距右边的纸面毫米（沿底边朝左），
     /// 局部 Y 为距下边的纸面毫米（沿右边朝上），图框旋转时按格子自身方向判定命中。
@@ -1583,13 +1608,10 @@ public static class RectangleFrameScanner
             axes.Up * axes.CadPerMm,
             LocalRectangle.FromPoints(box.RightMm, box.BottomMm, box.LeftMm, box.TopMm));
     }
-
     /// <summary>属性 Tag「图号」的严格匹配名。</summary>
     private const string DrawingNumberAttributeTag = "图号";
-
     /// <summary>属性 Tag「图名」的严格匹配名。</summary>
     private const string TitleAttributeTag = "图名";
-
     /// <summary>
     /// 在当前布局空间一次性枚举顶层块参照属性，把框内非空「图号」「图名」填入作业。
     /// 同一框多个命中时取离该框右下角（MaxX, MinY）最近的；不深入嵌套块。
@@ -1604,7 +1626,6 @@ public static class RectangleFrameScanner
         {
             return;
         }
-
         var numberCandidates = new List<(string Text, double X, double Y)>();
         var titleCandidates = new List<(string Text, double X, double Y)>();
         using (var tr = database.TransactionManager.StartTransaction())
@@ -1616,7 +1637,10 @@ public static class RectangleFrameScanner
                 {
                     continue;
                 }
-
+                if (!IsBlockAllowedByFrameFilter(blockRef))
+                {
+                    continue;
+                }
                 if (!IsEntityVisible(blockRef)
                     || string.Equals(blockRef.Layer, TemporaryOverlayLayer, StringComparison.OrdinalIgnoreCase)
                     || !IsEntityLayerScannable(tr, blockRef)
@@ -1625,7 +1649,6 @@ public static class RectangleFrameScanner
                 {
                     continue;
                 }
-
                 foreach (ObjectId attributeId in blockRef.AttributeCollection)
                 {
                     if (tr.GetObject(attributeId, OpenMode.ForRead, false) is not AttributeReference attribute
@@ -1633,14 +1656,12 @@ public static class RectangleFrameScanner
                     {
                         continue;
                     }
-
                     var tag = (attribute.Tag ?? "").Trim();
                     var text = GetAttributeDisplayText(attribute).Trim();
                     if (string.IsNullOrEmpty(text))
                     {
                         continue;
                     }
-
                     var point = attribute.Position;
                     if (string.Equals(tag, DrawingNumberAttributeTag, StringComparison.Ordinal))
                     {
@@ -1652,15 +1673,12 @@ public static class RectangleFrameScanner
                     }
                 }
             }
-
             tr.Commit();
         }
-
         if (numberCandidates.Count == 0 && titleCandidates.Count == 0)
         {
             return;
         }
-
         for (var i = 0; i < results.Count; i++)
         {
             var rectangle = rectangles[i];
@@ -1671,7 +1689,6 @@ public static class RectangleFrameScanner
                 job.CadDrawingNumber = drawingNumber;
                 job.DrawingNumber = drawingNumber;
             }
-
             if (string.IsNullOrWhiteSpace(job.CadTitle)
                 && TryPickClosestAttribute(titleCandidates, rectangle, out var title))
             {
@@ -1680,7 +1697,6 @@ public static class RectangleFrameScanner
             }
         }
     }
-
     /// <summary>
     /// 在矩形范围内的候选中选取离右下角最近的属性值。
     /// </summary>
@@ -1700,7 +1716,6 @@ public static class RectangleFrameScanner
             {
                 continue;
             }
-
             var dx = candidate.X - cornerX;
             var dy = candidate.Y - cornerY;
             var distance = dx * dx + dy * dy;
@@ -1708,20 +1723,16 @@ public static class RectangleFrameScanner
             {
                 continue;
             }
-
             bestDistance = distance;
             best = candidate.Text;
         }
-
         if (best == null)
         {
             return false;
         }
-
         text = best;
         return true;
     }
-
     /// <summary>
     /// 判断点是否在打印矩形内。有实际角点时用多边形判定，避免旋转框 AABB 误收框外点。
     /// </summary>
@@ -1738,10 +1749,8 @@ public static class RectangleFrameScanner
             };
             return IsPointInsidePolygon(new Point3d(x, y, 0), polygon);
         }
-
         return rectangle.Contains(x, y);
     }
-
     /// <summary>射线法判断点是否在多边形内（含边界）。</summary>
     private static bool IsPointInsidePolygon(Point3d point, Point3d[] polygon)
     {
@@ -1762,7 +1771,6 @@ public static class RectangleFrameScanner
             {
                 return true;
             }
-
             var crossesScanLine = (start.Y > point.Y) != (end.Y > point.Y);
             if (crossesScanLine
                 && point.X < (end.X - start.X) * (point.Y - start.Y) / (end.Y - start.Y + 1e-30) + start.X)
@@ -1770,16 +1778,13 @@ public static class RectangleFrameScanner
                 inside = !inside;
             }
         }
-
         return inside;
     }
-
     /// <summary>读取属性显示文字。</summary>
     private static string GetAttributeDisplayText(AttributeReference attribute)
     {
         return attribute.TextString ?? "";
     }
-
     private static Point3d[] GetWorldPoints(LocalRectangle rectangle)
     {
         if (rectangle.CornerPoints is { Length: >= 8 } points)
@@ -1792,14 +1797,11 @@ public static class RectangleFrameScanner
                 new Point3d(points[6], points[7], 0)
             };
         }
-
         return CadSelectionWindow.GetCorners(rectangle);
     }
-
     // ═══════════════════════════════════════════════════════════════
     // 布局范围判断（与 TitleBlockScanner 一致）
     // ═══════════════════════════════════════════════════════════════
-
     private static bool ShouldScanLayout(
         Layout layout,
         TitleBlockScanScope scope,
@@ -1814,7 +1816,6 @@ public static class RectangleFrameScanner
                 return false;
             }
         }
-
         switch (scope)
         {
             case TitleBlockScanScope.PaperLayouts:
@@ -1829,17 +1830,14 @@ public static class RectangleFrameScanner
                 return false;
         }
     }
-
     private static bool IsCurrentSpace(Layout layout, string? currentSpaceName)
     {
         if (string.IsNullOrWhiteSpace(currentSpaceName))
         {
             return false;
         }
-
         return string.Equals(layout.LayoutName, currentSpaceName, StringComparison.OrdinalIgnoreCase);
     }
-
     private static string? GetCurrentSpaceName(Database db)
     {
         try
@@ -1862,15 +1860,12 @@ public static class RectangleFrameScanner
             {
                 // 没有打开的文档或数据库不可用
             }
-
             return null;
         }
     }
-
     // ═══════════════════════════════════════════════════════════════
     // 递归实体遍历
     // ═══════════════════════════════════════════════════════════════
-
     /// <summary>
     /// 递归遍历实体及其子实体（块定义内部），检测矩形 Polyline 并收集 Line/Polyline 线段。
     ///
@@ -1911,7 +1906,6 @@ public static class RectangleFrameScanner
         {
             return;
         }
-
         // 用户在 CAD 中看不到的实体不能成为打印边界。这里必须在所有类型分支之前统一拦截，
         // 不仅覆盖闭合 Polyline/Polyline2d/Polyline3d，也覆盖隐藏的父块参照；否则父块不可见时，
         // 递归进入块定义仍可能把内部矩形识别成图框。图框允许位于 Defpoints 等不打印图层，
@@ -1920,7 +1914,6 @@ public static class RectangleFrameScanner
         {
             return;
         }
-
         // ── 分支 0：Line → 收集线段（仅块内部，最多 3 层）──
         if (segments != null
             && depth <= 3
@@ -1928,7 +1921,6 @@ public static class RectangleFrameScanner
         {
             FourLineRectangleFinder.TryAddLine(line, transform, segments);
         }
-
         // ── 分支 0.5：开放直线型 PL → 每个实体只提取首尾端点作为一条矩形边 ──
         if (segments != null
             && depth <= 3
@@ -1937,7 +1929,6 @@ public static class RectangleFrameScanner
         {
             segments.Add(polylineSegment);
         }
-
         // 老式开放 POLYLINE 也按一个独立实体处理；仅允许全部顶点共线且无圆弧。
         if (segments != null
             && depth <= 3
@@ -1950,7 +1941,6 @@ public static class RectangleFrameScanner
         {
             segments.Add(legacyPolylineSegment);
         }
-
         // ── 分支 1：Polyline（轻量线）→ 矩形检测 ──
         if (entity is Polyline polyline
             // 图框 PL 可能专门放在 Defpoints 或其他”不打印”辅助层；
@@ -1965,7 +1955,6 @@ public static class RectangleFrameScanner
             // 先全部收集，不去重——不同实例的同一定义各自独立，去重放在后续 FilterRectangles
             rectangles.Add(rectangle);
         }
-
         // ── 分支 1b：Polyline2d（老式 POLYLINE+VERTEX）→ 矩形检测 ──
         // 旧版 CAD 绘制的图框常用老式多段线，LIST 命令输出 “POLYLINE/VERTEX”，
         // .NET API 类型为 Polyline2d，与轻量 Polyline 不同，需单独处理。
@@ -1980,7 +1969,6 @@ public static class RectangleFrameScanner
         {
             rectangles.Add(rectangle2d);
         }
-
         // ── 分支 1c：Polyline3d（3DPOLY）→ 矩形检测 ──
         // 三维多段线在 XY 平面上也可构成矩形图框，顶点类型为 Vertex3d。
         if (entity is Polyline3d polyline3d
@@ -1994,28 +1982,27 @@ public static class RectangleFrameScanner
         {
             rectangles.Add(rectangle3d);
         }
-
         // ── 分支 2：BlockReference → 缓存 + 递归进入 ──
         if (entity is not BlockReference blockReference || depth >= 12)
         {
             return;
         }
-
+        if (!IsBlockAllowedByFrameFilter(blockReference))
+        {
+            return;
+        }
         // XCLIP 裁切过的块不参与扫描
         if (IsBlockClipped(tr, blockReference))
         {
             return;
         }
-
         var definitionId = blockReference.BlockTableRecord;
         if (definitionId.IsNull)
         {
             // 块定义丢失的损坏 INSERT，无几何可取。
             return;
         }
-
         var instanceXform = blockReference.BlockTransform * transform;
-
         // 块定义缓存：同一块定义只遍历一次，后续实例直接变换缓存的局部坐标结果。
         if (BlockDefinitionCache.TryGetValue(definitionId, out var cachedRects))
         {
@@ -2025,17 +2012,14 @@ public static class RectangleFrameScanner
             }
             return;
         }
-
         // 防循环：同一个块定义在一条递归路径上只进入一次
         if (!visitedDefinitions.Add(definitionId))
         {
             return;
         }
-
         try
         {
             var definition = (BlockTableRecord)tr.GetObject(definitionId, OpenMode.ForRead);
-
             // 用单位矩阵遍历获取块局部坐标，存入缓存供其他实例复用。
             // 同一块定义内只保留最大的矩形框。
             // 四线段拼合在块内独立处理；深度 ≤ 3 层。
@@ -2050,19 +2034,16 @@ public static class RectangleFrameScanner
                 {
                     continue;
                 }
-
                 // 递归阶段不能按“是否打印”提前截断，否则块内不可打印层上的图框 PL
                 // 永远到不了下面的矩形检测分支。图框边实体只要求图层可见，内容输出仍严格检查可打印性。
                 if (!IsEntityLayerVisibleForScanning(tr, nested))
                 {
                     continue;
                 }
-
                 if (!IsEntityVisible(nested))
                 {
                     continue;
                 }
-
                 // 用单位矩阵递归 → 子实体结果均在当前块定义局部坐标下
                 CollectEntityRectangles(
                     tr,
@@ -2074,13 +2055,11 @@ public static class RectangleFrameScanner
                     depth + 1,
                     recognizeFourLineRectangles);
             }
-
             if (blockSegments != null && blockSegments.Count >= 4)
             {
                 var segRects = FourLineRectangleFinder.Find(blockSegments, _activeCancel, (msg, cur, tot) => ReportScan(msg, cur, tot));
                 localRects.AddRange(segRects);
             }
-
             // 缓存局部坐标下的最大矩形，并变换到当前实例的世界坐标
             List<LocalRectangle> cacheEntry;
             if (localRects.Count > 0)
@@ -2093,7 +2072,6 @@ public static class RectangleFrameScanner
             {
                 cacheEntry = new List<LocalRectangle>();
             }
-
             BlockDefinitionCache[definitionId] = cacheEntry;
         }
         catch
@@ -2106,11 +2084,9 @@ public static class RectangleFrameScanner
             visitedDefinitions.Remove(definitionId);
         }
     }
-
     // ═══════════════════════════════════════════════════════════════
     // 可见性 & 图层过滤
     // ═══════════════════════════════════════════════════════════════
-
     /// <summary>查询实体在 CAD 引擎中的可见性。动态块隐藏状态自动为 false。</summary>
     private static bool IsEntityVisible(Entity entity)
     {
@@ -2124,7 +2100,6 @@ public static class RectangleFrameScanner
             return true;
         }
     }
-
     /// <summary>
     /// 图层是否可扫描：必须在开启、未冻结、可打印的图层上。
     /// 关闭或冻结的图层通常对应动态块的隐藏状态。
@@ -2138,18 +2113,15 @@ public static class RectangleFrameScanner
             {
                 return false;
             }
-
             if (LayerScannableCache.TryGetValue(entity.LayerId, out var cached))
             {
                 return cached;
             }
-
             if (tr.GetObject(entity.LayerId, OpenMode.ForRead, false) is not LayerTableRecord layer)
             {
                 LayerScannableCache[entity.LayerId] = false;
                 return false;
             }
-
             var result = !layer.IsOff      // 图层未关闭
                 && !layer.IsFrozen         // 图层未冻结
                 && layer.IsPlottable;      // 图层可打印
@@ -2161,7 +2133,6 @@ public static class RectangleFrameScanner
             return false;
         }
     }
-
     /// <summary>
     /// 图框边界的图层过滤规则：图层必须开启且未冻结，但允许设置为“不打印”。
     /// 不打印属性只决定图素是否输出，不应阻止闭合 PL 或四个独立边实体作为打印边界。
@@ -2170,7 +2141,6 @@ public static class RectangleFrameScanner
     {
         return IsEntityLayerVisibleForScanning(tr, entity);
     }
-
     /// <summary>
     /// 判断图层在当前图形中是否可见，仅检查关闭/冻结状态，不检查 IsPlottable。
     /// 此规则只用于查找图框边界和递归进入块定义；内容过滤仍调用严格的
@@ -2185,7 +2155,6 @@ public static class RectangleFrameScanner
             {
                 return false;
             }
-
             return !layer.IsOff && !layer.IsFrozen;
         }
         catch
@@ -2193,7 +2162,6 @@ public static class RectangleFrameScanner
             return false;
         }
     }
-
     /// <summary>
     /// 检查块参照是否被 XCLIP 命令裁切过。
     /// XCLIP 通过扩展字典中的 "ACAD_FILTER" 条目存储裁切边界，
@@ -2207,7 +2175,6 @@ public static class RectangleFrameScanner
             {
                 return false;
             }
-
             var extDict = (DBDictionary)tr.GetObject(blockRef.ExtensionDictionary, OpenMode.ForRead);
             return extDict.Contains("ACAD_FILTER");
         }
@@ -2216,12 +2183,10 @@ public static class RectangleFrameScanner
             return false;
         }
     }
-
     // 多段线矩形判定与角点变换统一由 RectangleGeometry 提供，扫描器仅保留扫描策略。
     // ═══════════════════════════════════════════════════════════════
     // 矩形过滤：去重、去嵌套
     // ═══════════════════════════════════════════════════════════════
-
     /// <summary>
     /// 过滤矩形列表：去重 + 去嵌套。
     ///
@@ -2233,7 +2198,6 @@ public static class RectangleFrameScanner
     private static List<LocalRectangle> FilterRectangles(IEnumerable<LocalRectangle> source)
     {
         var unique = new List<LocalRectangle>();
-
         // 按面积降序遍历，确保大的先进入 unique 列表
         foreach (var rectangle in source.OrderByDescending(Area))
         {
@@ -2245,10 +2209,8 @@ public static class RectangleFrameScanner
             {
                 continue;
             }
-
             unique.Add(rectangle);
         }
-
         // 去嵌套：任何候选打印框只要被另一个候选框完整包含，就舍弃内部框。
         // 外框已经覆盖该打印区域，不能再让内框生成第二个打印任务。
         return unique
@@ -2258,7 +2220,6 @@ public static class RectangleFrameScanner
                 && Contains(container, candidate)))
             .ToList();
     }
-
     /// <summary>两个矩形包围盒是否相同（四个边界都在容差内）。</summary>
     private static bool SameBounds(LocalRectangle a, LocalRectangle b, double tolerance)
     {
@@ -2267,7 +2228,6 @@ public static class RectangleFrameScanner
             && Math.Abs(a.MaxX - b.MaxX) <= tolerance
             && Math.Abs(a.MaxY - b.MaxY) <= tolerance;
     }
-
     /// <summary>
     /// 两个矩形是否高度重叠（视为同一图纸的多重描边）。
     ///
@@ -2285,14 +2245,12 @@ public static class RectangleFrameScanner
         {
             return false;
         }
-
         var areaA = Area(a);
         var areaB = Area(b);
         if (areaA <= 0 || areaB <= 0)
         {
             return false;
         }
-
         // 重叠占小矩形的比例
         var smallerCoverage = overlapArea / Math.Min(areaA, areaB);
         // 重叠占大矩形的比例
@@ -2302,17 +2260,14 @@ public static class RectangleFrameScanner
             / Math.Max(a.MaxX - a.MinX, b.MaxX - b.MinX);
         var heightSimilarity = Math.Min(a.MaxY - a.MinY, b.MaxY - b.MinY)
             / Math.Max(a.MaxY - a.MinY, b.MaxY - b.MinY);
-
         return smallerCoverage >= 0.90
             && largerCoverage >= 0.82
             && widthSimilarity >= 0.90
             && heightSimilarity >= 0.90;
     }
-
     // ═══════════════════════════════════════════════════════════════
     // 几何工具
     // ═══════════════════════════════════════════════════════════════
-
     /// <summary>outer 是否完全包含 inner（含 0.3% 容差）。</summary>
     private static bool Contains(LocalRectangle outer, LocalRectangle inner)
     {
@@ -2322,14 +2277,12 @@ public static class RectangleFrameScanner
             && inner.MaxX <= outer.MaxX + tolerance
             && inner.MaxY <= outer.MaxY + tolerance;
     }
-
     /// <summary>矩形包围盒面积（>=0）。</summary>
     private static double Area(LocalRectangle rectangle)
     {
         return Math.Max(0, rectangle.MaxX - rectangle.MinX)
             * Math.Max(0, rectangle.MaxY - rectangle.MinY);
     }
-
     /// <summary>两个轴对齐矩形是否相交。</summary>
     private static bool Intersects(LocalRectangle rectangle, LocalRectangle window)
     {
@@ -2338,11 +2291,9 @@ public static class RectangleFrameScanner
             && rectangle.MaxY >= window.MinY
             && rectangle.MinY <= window.MaxY;
     }
-
     // ═══════════════════════════════════════════════════════════════
     // 空框过滤：检查矩形内是否存在实际的绘图内容（图素）
     // ═══════════════════════════════════════════════════════════════
-
     /// <summary>
     /// 过滤掉没有任何可见可打印图素的空矩形框。
     ///
@@ -2363,7 +2314,6 @@ public static class RectangleFrameScanner
 	    {
 	        using var tr = database.TransactionManager.StartTransaction();
 	        var owner = (BlockTableRecord)tr.GetObject(ownerId, OpenMode.ForRead);
-
 	        // 预扫描：一次性收集所有实体的世界坐标外包盒（含嵌套块）
 	        var entityBoxes = new List<LocalRectangle>();
 	        var boxSw = _activeProfile != null ? Stopwatch.StartNew() : null;
@@ -2374,7 +2324,6 @@ public static class RectangleFrameScanner
 	            boxSw.Stop();
 	            _activeProfile.EmptyBoxCollectMs += boxSw.ElapsedMilliseconds;
 	        }
-
 	        // 内存级矩形相交判断，不再访问 CAD 数据库
 	        var result = new List<LocalRectangle>();
 	        foreach (var rect in candidates)
@@ -2384,10 +2333,8 @@ public static class RectangleFrameScanner
 	                result.Add(rect);
 	            }
 	        }
-
 	        return result;
 	    }
-
 	    /// <summary>
 	    /// 递归收集空间内所有实体的世界坐标外包盒，过滤规则与旧 CheckEntityContent 一致：
 	    /// 跳过临时标注图层、不可打印图层、不可见实体；块参照递归进入（防循环、防过深）。
@@ -2408,31 +2355,26 @@ public static class RectangleFrameScanner
 	            {
 	                ReportScan($"正在检查空框… 已处理 {visits:N0}", visits, 0);
 	            }
-
 	            visits++;
 	            if (tr.GetObject(id, OpenMode.ForRead, false) is not Entity entity)
 	            {
 	                continue;
 	            }
-
 	            // 跳过临时标注图层
 	            if (string.Equals(entity.Layer, TemporaryOverlayLayer, StringComparison.OrdinalIgnoreCase))
 	            {
 	                continue;
 	            }
-
 	            // 跳过不可打印图层的实体
 	            if (!IsEntityLayerScannable(tr, entity))
 	            {
 	                continue;
 	            }
-
 	            // 跳过不可见实体
 	            if (!IsEntityVisible(entity))
 	            {
 	                continue;
 	            }
-
 	            // 收集当前实体的世界坐标外包盒
 	            try
 	            {
@@ -2447,24 +2389,20 @@ public static class RectangleFrameScanner
 	            {
 	                // 部分实体（如空块参照）可能抛出异常，忽略
 	            }
-
 	            // ── 递归进入块参照 ──
 	            if (entity is not BlockReference blockRef || depth >= 5)
 	            {
 	                continue;
 	            }
-
 	            if (IsBlockClipped(tr, blockRef))
 	            {
 	                continue;
 	            }
-
 	            var definitionId = blockRef.BlockTableRecord;
 	            if (definitionId.IsNull || !visitedDefinitions.Add(definitionId))
 	            {
 	                continue;
 	            }
-
 	            try
 	            {
 	                var definition = (BlockTableRecord)tr.GetObject(definitionId, OpenMode.ForRead);
@@ -2476,11 +2414,9 @@ public static class RectangleFrameScanner
 	            {
 	                // 损坏的块定义无法读取，跳过
 	            }
-
 	            visitedDefinitions.Remove(definitionId);
 	        }
 	    }
-
 	    /// <summary>
 	    /// 检查预收集的实体外包盒列表中是否有任意一个与目标矩形相交。
 	    /// 纯内存操作，短路退出。
@@ -2494,7 +2430,6 @@ public static class RectangleFrameScanner
 	                return true;
 	            }
 	        }
-
 	        return false;
 	    }
 	}

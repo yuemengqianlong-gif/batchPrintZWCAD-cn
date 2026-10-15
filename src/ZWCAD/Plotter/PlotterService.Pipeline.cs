@@ -312,41 +312,85 @@ public static partial class PlotterService
         }
     }
 
-    /** RunPreview：创建预览引擎显示打印预览。 */
+    /** RunPreview：创建预览引擎显示打印预览。
+     *  ESC 取消（eUserBreak）视为正常退出，不弹错误；
+     *  ESC 中断后引擎可能残留失效状态，导致下一次预览报空引用——失败自动重建引擎重试一次。 */
     private static void RunPreview(PlotInfo plotInfo, string documentName)
     {
-        using var engine = PlotFactory.CreatePreviewEngine((int)PreviewEngineFlags.Plot);
-        var plotStarted = false;
-        var documentStarted = false;
-        var pageStarted = false;
-        var graphicsStarted = false;
+        const int maxAttempts = 2;
+        for (var attempt = 1; ; attempt++)
+        {
+            var engine = PlotFactory.CreatePreviewEngine((int)PreviewEngineFlags.Plot);
+            if (engine == null)
+            {
+                if (attempt >= maxAttempts)
+                {
+                    throw new InvalidOperationException("无法创建打印预览引擎（引擎创建返回空）。");
+                }
 
-        try
-        {
-            engine.BeginPlot(null, null);
-            plotStarted = true;
-            engine.BeginDocument(plotInfo, documentName, null, 1, false, null);
-            documentStarted = true;
-            using var pageInfo = new PlotPageInfo();
-            engine.BeginPage(pageInfo, plotInfo, true, null);
-            pageStarted = true;
-            engine.BeginGenerateGraphics(null);
-            graphicsStarted = true;
-            engine.EndGenerateGraphics(null);
-            graphicsStarted = false;
-            engine.EndPage(null);
-            pageStarted = false;
-            engine.EndDocument(null);
-            documentStarted = false;
-            engine.EndPlot(null);
-            plotStarted = false;
-        }
-        finally
-        {
-            if (graphicsStarted) TryPlotCleanup(() => engine.EndGenerateGraphics(null));
-            if (pageStarted) TryPlotCleanup(() => engine.EndPage(null));
-            if (documentStarted) TryPlotCleanup(() => engine.EndDocument(null));
-            if (plotStarted) TryPlotCleanup(() => engine.EndPlot(null));
+                Thread.Sleep(400);
+                continue;
+            }
+
+            var plotStarted = false;
+            var documentStarted = false;
+            var pageStarted = false;
+            var graphicsStarted = false;
+            try
+            {
+                engine.BeginPlot(null, null);
+                plotStarted = true;
+                engine.BeginDocument(plotInfo, documentName, null, 1, false, null);
+                documentStarted = true;
+                using var pageInfo = new PlotPageInfo();
+                engine.BeginPage(pageInfo, plotInfo, true, null);
+                pageStarted = true;
+                engine.BeginGenerateGraphics(null);
+                graphicsStarted = true;
+                engine.EndGenerateGraphics(null);
+                graphicsStarted = false;
+                engine.EndPage(null);
+                pageStarted = false;
+                engine.EndDocument(null);
+                documentStarted = false;
+                engine.EndPlot(null);
+                plotStarted = false;
+                return;
+            }
+            catch (Exception ex)
+            {
+                if (IsPlotCancelledByUser(ex))
+                {
+                    // 用户在预览窗按 ESC / 取消：正常退出，不当作失败。
+                    return;
+                }
+
+                if (attempt >= maxAttempts)
+                {
+                    throw;
+                }
+
+                // 非 ESC 导致的失败：等待引擎空闲后重建引擎整体重试一次。
+                try
+                {
+                    WaitForPlotIdle();
+                }
+                catch
+                {
+                    // 等待超时也照常重试一次。
+                }
+
+                Thread.Sleep(300);
+            }
+            finally
+            {
+                if (graphicsStarted) TryPlotCleanup(() => engine.EndGenerateGraphics(null));
+                if (pageStarted) TryPlotCleanup(() => engine.EndPage(null));
+                if (documentStarted) TryPlotCleanup(() => engine.EndDocument(null));
+                if (plotStarted) TryPlotCleanup(() => engine.EndPlot(null));
+                // 引擎 Dispose 在 ESC 中断后可能抛空引用；吞掉，避免掩盖原始异常。
+                TryPlotCleanup(engine.Dispose);
+            }
         }
     }
 }

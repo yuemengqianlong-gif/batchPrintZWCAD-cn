@@ -387,6 +387,83 @@
             </TabItem>
 
             <!-- ══ 比例设置 ══ -->
+            <!-- ══ 属性框配置 ══ -->
+            <TabItem Header="属性框配置">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" Margin="10,10,10,0">
+                    <StackPanel>
+
+                        <GroupBox Header="图框块名限定设置" Margin="0,0,0,4" Padding="8">
+                            <StackPanel>
+                                <TextBlock Foreground="DimGray" TextWrapping="Wrap"
+                                           Text="限定可作为图框识别的图块块名：命中的图块参与图框识别，其余图块整体排除，减少干扰、加快识别速度。留空时按原有逻辑识别，不做限定。" />
+                                <Grid Margin="0,6,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="64" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="图框名" VerticalAlignment="Center" />
+                                    <TextBox x:Name="_frameBlockNameFilter" Grid.Column="1" Margin="0,0,6,0"
+                                             MaxLength="500" VerticalContentAlignment="Center"
+                                             ToolTip="多个块名用英文逗号分隔，如：A2图框,中机设计；支持 CAD 通配符，如 *图框 可同时匹配 A0图框、A1图框、A2图框。" />
+                                    <Button x:Name="_pickFrameBlockButton" Grid.Column="2" Content="拾取" MinWidth="72"
+                                            Style="{StaticResource PluginButtonStyle}"
+                                            ToolTip="在当前图纸中点选一个图框块，自动把其块名填入上图（已含名称则追加）。"
+                                            Click="OnPickFrameBlockNameClick" />
+                                </Grid>
+                                <TextBlock Foreground="DimGray" Margin="0,4,0,0"
+                                           Text="多个块名用英文逗号分隔，支持通配符 * ? #（如 *图框）" />
+                                <CheckBox x:Name="_frameBlockOnlyMode" Margin="0,8,0,0"
+                                          Content="仅识别块图框" HorizontalContentAlignment="Left"
+                                          ToolTip="勾选后：只把命中图框块名限定、通过图签 TAG 验证且尺寸符合 GB/T 14689 标准图幅（A0~A4 基础幅面及加长图幅）的图块识别为打印区域；其他图块、矩形、四线拼合图元一律不再参与识别。不勾选时按原有规则扫描图块与矩形。" />
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="图签信息对应的图块属性名称设置" Margin="0,0,0,4" Padding="8">
+                            <StackPanel>
+                                <TextBlock Foreground="DimGray" TextWrapping="Wrap"
+                                           Text="填写图签属性块中各个属性标记（TAG）的名称，识别结果用于生成目录、PDF 书签和文件名；留空即不参与识别。图框仍按尺寸识别图幅，此处只影响图签文字信息的提取。" />
+                                <Grid Margin="0,6,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+                                    <TextBlock Grid.Row="0" Grid.Column="0" Text="图号" />
+                                    <TextBlock Grid.Row="0" Grid.Column="1" Text="版次" />
+                                    <TextBlock Grid.Row="0" Grid.Column="2" Text="图名" />
+                                    <TextBlock Grid.Row="0" Grid.Column="3" Text="日期" />
+                                    <TextBlock Grid.Row="0" Grid.Column="4" Text="信息1" />
+                                    <TextBlock Grid.Row="0" Grid.Column="5" Text="信息2" />
+                                    <TextBox x:Name="_tagDrawingNumber" Grid.Row="1" Grid.Column="0" Margin="0,2,4,0"
+                                             MaxLength="60" VerticalContentAlignment="Center" />
+                                    <TextBox x:Name="_tagRevision" Grid.Row="1" Grid.Column="1" Margin="0,2,4,0"
+                                             MaxLength="60" VerticalContentAlignment="Center" />
+                                    <TextBox x:Name="_tagTitle" Grid.Row="1" Grid.Column="2" Margin="0,2,4,0"
+                                             MaxLength="60" VerticalContentAlignment="Center" />
+                                    <TextBox x:Name="_tagDate" Grid.Row="1" Grid.Column="3" Margin="0,2,4,0"
+                                             MaxLength="60" VerticalContentAlignment="Center" />
+                                    <TextBox x:Name="_tagInfo1" Grid.Row="1" Grid.Column="4" Margin="0,2,4,0"
+                                             MaxLength="60" VerticalContentAlignment="Center" />
+                                    <TextBox x:Name="_tagInfo2" Grid.Row="1" Grid.Column="5" Margin="0,2,0,0"
+                                             MaxLength="60" VerticalContentAlignment="Center" />
+                                </Grid>
+                            </StackPanel>
+                        </GroupBox>
+
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ══ 比例设置 ══ -->
+
             <TabItem Header="比例设置">
                 <Grid Margin="10">
                     <Grid.RowDefinitions>
@@ -444,14 +521,14 @@
                                         HorizontalAlignment="Stretch" Margin="0,2"
                                         Style="{StaticResource PluginButtonStyle}"
                                         Click="OnPickScaleClick" />
-                                <Button x:Name="_removeScaleButton" Content="删除选中的自定义比例" MinWidth="170"
+                                <Button x:Name="_removeScaleButton" Content="删除选中的比例" MinWidth="170"
                                         HorizontalAlignment="Stretch" Margin="0,2" IsEnabled="False"
                                         Style="{StaticResource PluginButtonStyle}"
                                         Click="OnRemoveScaleClick" />
                                 <TextBlock x:Name="_scaleSelectionHint" Foreground="DimGray" Margin="0,4,0,0"
                                            TextTrimming="CharacterEllipsis" TextWrapping="Wrap" />
                                 <TextBlock Foreground="DimGray" Margin="0,4,0,0" TextWrapping="Wrap"
-                                           Text="从图中拾取时，框选图框并选择 A0~A4 图幅，程序按短边计算比例。新增和删除操作将在点击“保存”后生效。" />
+                                           Text="从图中拾取时，框选图框并选择 A0~A4 图幅，程序按短边计算比例。选中不需要的比例后点“删除选中的比例”，被删除的内置比例不再参与通用型批打识别；操作在点击“保存”后生效。仅影响识别，不影响已生成任务的纸张/比例。" />
                             </StackPanel>
                         </GroupBox>
                     </Grid>
